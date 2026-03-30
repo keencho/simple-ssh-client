@@ -714,7 +714,13 @@ function makeDraggableResizable(panel: HTMLElement, header: HTMLElement) {
     panel.style.width = Math.max(500, startW + (e.clientX - resizeX)) + "px";
     panel.style.height = Math.max(350, startH + (e.clientY - resizeY)) + "px";
   });
-  document.addEventListener("mouseup", () => { isResizing = false; });
+  document.addEventListener("mouseup", () => {
+    if (isResizing) {
+      isResizing = false;
+      localStorage.setItem("sftp-panel-w", String(panel.offsetWidth));
+      localStorage.setItem("sftp-panel-h", String(panel.offsetHeight));
+    }
+  });
 
   // Click to bring to front
   panel.addEventListener("mousedown", () => bringToFront(panel));
@@ -734,11 +740,16 @@ async function openSftpPanel(sessionId: string) {
   const panelId = `sftp-${++sftpPanelCounter}`;
   const offset = (sftpPanelCounter % 5) * 30;
 
+  const savedW = localStorage.getItem("sftp-panel-w");
+  const savedH = localStorage.getItem("sftp-panel-h");
+
   const panel = document.createElement("div");
   panel.className = "sftp-panel";
   panel.id = panelId;
   panel.style.left = (80 + offset) + "px";
   panel.style.top = (40 + offset) + "px";
+  if (savedW) panel.style.width = savedW + "px";
+  if (savedH) panel.style.height = savedH + "px";
   panel.innerHTML = `
     <div class="sftp-header">
       <div class="sftp-title">${ICONS.fileManager} ${escapeHtml(session.name)}</div>
