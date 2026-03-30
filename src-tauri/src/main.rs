@@ -3,8 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // --- Data Model ---
 
@@ -236,28 +239,40 @@ fn reorder_folders(folders: Vec<Folder>, root_folder_order: Option<u32>) -> Resu
 #[tauri::command]
 fn fix_key_permissions(key_path: &str) -> Result<(), String> {
     use std::process::Command;
+    use std::sync::Mutex;
+    static FIXED: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
     if key_path.is_empty() || !std::path::Path::new(key_path).exists() {
+        return Ok(());
+    }
+    if FIXED.lock().unwrap().contains(key_path) {
         return Ok(());
     }
     let user = whoami::username();
     // 0. Take ownership first (needed when current user has no access)
     let _ = Command::new("takeown")
         .args(["/f", key_path])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     // 1. Remove inheritance and inherited ACEs
     let _ = Command::new("icacls")
         .args([key_path, "/inheritance:r"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     // 2. Grant only current user read access
     let _ = Command::new("icacls")
         .args([key_path, "/grant:r", &format!("{user}:(R)")])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     // 3. Remove common groups that cause "too open" errors
     for group in ["Authenticated Users", "Users", "Everyone", "BUILTIN\\Users"] {
         let _ = Command::new("icacls")
             .args([key_path, "/remove:g", group])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
+    FIXED.lock().unwrap().insert(key_path.to_string());
     Ok(())
 }
 
