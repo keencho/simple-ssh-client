@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src-tauri/target/
+
+.idea/
+
+PLAN.md
+taskbar_crop.png
+taskbar_crop_2x.png
+taskbar_screenshot.png
+src-tauri/icons/_kc_*
+src-tauri/icons/_ks_*
+src-tauri/icons/_cmp_*
