@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open, confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
+import { open, save, confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
 
 // --- Types ---
 
@@ -34,6 +35,23 @@ interface SessionsData {
   root_folder_order: number | null;
 }
 
+interface RemoteEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+  modified: number;
+  permissions: string;
+}
+
+interface SftpProgress {
+  session_id: string;
+  filename: string;
+  bytes_transferred: number;
+  total_bytes: number;
+  direction: string;
+}
+
 // --- State ---
 
 let data: SessionsData = { folders: [], sessions: [], root_folder_order: null };
@@ -58,6 +76,13 @@ const ICONS = {
   terminal: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`,
   server: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/></svg>`,
   drag: `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" opacity="0.4"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>`,
+  fileManager: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
+  upload: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
+  download: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+  folderPlus: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>`,
+  file: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>`,
+  folderOpen: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>`,
+  arrowUp: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 19V5M5 12l7-7 7 7"/></svg>`,
 };
 
 // --- Helpers ---
@@ -99,6 +124,120 @@ function hasMatchingSessionsInFolder(folderId: string): boolean {
   return getSessionsForFolder(folderId).length > 0;
 }
 
+// --- Custom Dialogs ---
+
+function customAlert(message: string): Promise<void> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog-box">
+        <div class="dialog-message">${escapeHtml(message)}</div>
+        <div class="dialog-footer">
+          <button class="dialog-btn dialog-btn-ok">확인</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => { overlay.remove(); resolve(); };
+    overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", close);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape" || e.key === "Enter") { close(); document.removeEventListener("keydown", esc); } };
+    document.addEventListener("keydown", esc);
+    (overlay.querySelector(".dialog-btn-ok") as HTMLElement).focus();
+  });
+}
+
+function customConfirm(message: string, title?: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog-box">
+        ${title ? `<div class="dialog-title">${escapeHtml(title)}</div>` : ""}
+        <div class="dialog-message">${escapeHtml(message)}</div>
+        <div class="dialog-footer">
+          <button class="dialog-btn dialog-btn-cancel">취소</button>
+          <button class="dialog-btn dialog-btn-ok">확인</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = (val: boolean) => { overlay.remove(); resolve(val); };
+    overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", () => close(true));
+    overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(false));
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(false); });
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { close(false); document.removeEventListener("keydown", esc); } };
+    document.addEventListener("keydown", esc);
+    (overlay.querySelector(".dialog-btn-ok") as HTMLElement).focus();
+  });
+}
+
+interface TabResult {
+  completed: string | null;
+  candidates?: string[];
+}
+
+function customPrompt(message: string, defaultValue?: string, options?: { onTab?: (value: string) => Promise<TabResult> }): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dialog-overlay";
+    overlay.innerHTML = `
+      <div class="dialog-box">
+        <div class="dialog-message">${escapeHtml(message)}</div>
+        <input class="dialog-input" type="text" value="${escapeHtml(defaultValue || "")}" />
+        <div class="dialog-suggestions" style="display:none"></div>
+        <div class="dialog-footer">
+          <button class="dialog-btn dialog-btn-cancel">취소</button>
+          <button class="dialog-btn dialog-btn-ok">확인</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector(".dialog-input") as HTMLInputElement;
+    const suggestionsEl = overlay.querySelector(".dialog-suggestions") as HTMLElement;
+    const close = (val: string | null) => { overlay.remove(); resolve(val); };
+    overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", () => close(input.value));
+    overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(null));
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(null); });
+
+    const hideSuggestions = () => { suggestionsEl.style.display = "none"; suggestionsEl.innerHTML = ""; };
+
+    input.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter") { e.preventDefault(); close(input.value); }
+      else if (e.key === "Escape") {
+        e.preventDefault();
+        if (suggestionsEl.style.display !== "none") { hideSuggestions(); }
+        else { close(null); }
+      }
+      else if (e.key === "Tab" && options?.onTab) {
+        e.preventDefault();
+        const result = await options.onTab(input.value);
+        if (result.completed !== null) {
+          input.value = result.completed;
+          hideSuggestions();
+        }
+        if (result.candidates && result.candidates.length > 1) {
+          suggestionsEl.style.display = "block";
+          suggestionsEl.innerHTML = result.candidates.map(c =>
+            `<div class="dialog-suggestion-item">${ICONS.folderOpen} ${escapeHtml(c)}</div>`
+          ).join("");
+          suggestionsEl.querySelectorAll(".dialog-suggestion-item").forEach((item, i) => {
+            item.addEventListener("click", () => {
+              const parentDir = input.value.replace(/\/[^/]*$/, "") || "/";
+              input.value = (parentDir === "/" ? "/" : parentDir + "/") + result.candidates![i] + "/";
+              hideSuggestions();
+              input.focus();
+            });
+          });
+        }
+      }
+    });
+    input.addEventListener("input", hideSuggestions);
+    setTimeout(() => { input.focus(); input.select(); }, 50);
+  });
+}
+
 // --- Actions ---
 
 async function loadData() {
@@ -116,7 +255,7 @@ async function connectSession(id: string, newWindow: boolean) {
   try {
     await invoke("open_ssh", { id, newWindow });
   } catch (e) {
-    alert("연결 실패: " + e);
+    customAlert("연결 실패: " + e);
   }
 }
 
@@ -126,37 +265,37 @@ async function deleteSession(id: string) {
   deleteInProgress = true;
   try {
     const session = data.sessions.find((s) => s.id === id);
-    const ok = await tauriConfirm(`"${session?.name || id}" 세션을 삭제할까요?`, { title: "세션 삭제", kind: "warning" });
+    const ok = await customConfirm(`"${session?.name || id}" 세션을 삭제할까요?`, "세션 삭제");
     if (!ok) return;
     data = await invoke<SessionsData>("delete_session", { id });
     renderTree();
     renderStats();
   } catch (e) {
-    alert("삭제 실패: " + e);
+    customAlert("삭제 실패: " + e);
   } finally {
     deleteInProgress = false;
   }
 }
 
 async function addFolder() {
-  const name = prompt("폴더 이름:");
+  const name = await customPrompt("폴더 이름:");
   if (!name) return;
   try {
     data = await invoke<SessionsData>("create_folder", { name });
     renderTree();
     renderStats();
   } catch (e) {
-    alert("폴더 생성 실패: " + e);
+    customAlert("폴더 생성 실패: " + e);
   }
 }
 
 async function editFolder(id: string) {
   const folder = data.folders.find((f) => f.id === id);
   if (!folder) return;
-  const name = prompt("폴더 이름 변경 (비우면 삭제):", folder.name);
+  const name = await customPrompt("폴더 이름 변경 (비우면 삭제):", folder.name);
   if (name === null) return;
   if (!name) {
-    const ok = await tauriConfirm(`"${folder.name}" 폴더를 삭제할까요?\n(세션은 미분류로 이동됩니다)`, { title: "폴더 삭제", kind: "warning" });
+    const ok = await customConfirm(`"${folder.name}" 폴더를 삭제할까요?\n(세션은 미분류로 이동됩니다)`, "폴더 삭제");
     if (!ok) return;
     data = await invoke<SessionsData>("delete_folder", { id });
     collapsedFolders.delete(id);
@@ -364,7 +503,7 @@ function initDnD() {
       try {
         data = await invoke<SessionsData>("reorder_sessions", { sessions: updates });
       } catch (e) {
-        alert("순서 변경 실패: " + e);
+        customAlert("순서 변경 실패: " + e);
       }
     } else {
       let rootFolderOrder: number | null = null;
@@ -380,7 +519,7 @@ function initDnD() {
       try {
         data = await invoke<SessionsData>("reorder_folders", { folders: updates, rootFolderOrder });
       } catch (e) {
-        alert("순서 변경 실패: " + e);
+        customAlert("순서 변경 실패: " + e);
       }
     }
     renderTree();
@@ -495,7 +634,7 @@ function openModal(session?: SshSession, defaultFolderId?: string | null) {
     const user = (overlay.querySelector("#f-user") as HTMLInputElement).value.trim();
     const keyFile = (overlay.querySelector("#f-keyfile") as HTMLInputElement).value.trim();
     const folderId = (overlay.querySelector("#f-folder") as HTMLSelectElement).value || null;
-    if (!name || !host || !user) { alert("이름, Host, User는 필수 항목입니다."); return; }
+    if (!name || !host || !user) { customAlert("이름, Host, User는 필수 항목입니다."); return; }
 
     let jumpHost: JumpHost | null = null;
     if (jumpCb.checked) {
@@ -515,12 +654,483 @@ function openModal(session?: SshSession, defaultFolderId?: string | null) {
         data = await invoke<SessionsData>("create_session", { name, host, port, user, keyFile, folderId, jumpHost });
       }
       close(); renderTree(); renderStats();
-    } catch (e) { alert("저장 실패: " + e); }
+    } catch (e) { customAlert("저장 실패: " + e); }
   });
 
   const escHandler = (e: KeyboardEvent) => { if (e.key === "Escape") { close(); document.removeEventListener("keydown", escHandler); } };
   document.addEventListener("keydown", escHandler);
   setTimeout(() => (overlay.querySelector("#f-name") as HTMLInputElement)?.focus(), 50);
+}
+
+// --- SFTP File Manager ---
+
+function humanizeSize(bytes: number): string {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + " MB";
+  return (bytes / 1073741824).toFixed(1) + " GB";
+}
+
+function formatDate(ts: number): string {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+}
+
+let sftpPanelCounter = 0;
+
+function makeDraggableResizable(panel: HTMLElement, header: HTMLElement) {
+  // Drag
+  let isDragging = false, dragX = 0, dragY = 0;
+  header.addEventListener("mousedown", (e) => {
+    if ((e.target as HTMLElement).closest("button")) return;
+    isDragging = true;
+    dragX = e.clientX - panel.offsetLeft;
+    dragY = e.clientY - panel.offsetTop;
+    panel.style.transition = "none";
+    bringToFront(panel);
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!isDragging) return;
+    panel.style.left = Math.max(0, e.clientX - dragX) + "px";
+    panel.style.top = Math.max(0, e.clientY - dragY) + "px";
+  });
+  document.addEventListener("mouseup", () => { isDragging = false; });
+
+  // Resize
+  const handle = document.createElement("div");
+  handle.className = "sftp-resize-handle";
+  panel.appendChild(handle);
+  let isResizing = false, resizeX = 0, resizeY = 0, startW = 0, startH = 0;
+  handle.addEventListener("mousedown", (e) => {
+    isResizing = true;
+    resizeX = e.clientX; resizeY = e.clientY;
+    startW = panel.offsetWidth; startH = panel.offsetHeight;
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!isResizing) return;
+    panel.style.width = Math.max(500, startW + (e.clientX - resizeX)) + "px";
+    panel.style.height = Math.max(350, startH + (e.clientY - resizeY)) + "px";
+  });
+  document.addEventListener("mouseup", () => { isResizing = false; });
+
+  // Click to bring to front
+  panel.addEventListener("mousedown", () => bringToFront(panel));
+}
+
+function bringToFront(panel: HTMLElement) {
+  const panels = document.querySelectorAll(".sftp-panel");
+  let maxZ = 1000;
+  panels.forEach(p => { maxZ = Math.max(maxZ, parseInt((p as HTMLElement).style.zIndex || "1000")); });
+  panel.style.zIndex = String(maxZ + 1);
+}
+
+async function openSftpPanel(sessionId: string) {
+  const session = data.sessions.find(s => s.id === sessionId);
+  if (!session) return;
+
+  const panelId = `sftp-${++sftpPanelCounter}`;
+  const offset = (sftpPanelCounter % 5) * 30;
+
+  const panel = document.createElement("div");
+  panel.className = "sftp-panel";
+  panel.id = panelId;
+  panel.style.left = (80 + offset) + "px";
+  panel.style.top = (40 + offset) + "px";
+  panel.innerHTML = `
+    <div class="sftp-header">
+      <div class="sftp-title">${ICONS.fileManager} ${escapeHtml(session.name)}</div>
+      <button class="sftp-close">${ICONS.close}</button>
+    </div>
+    <div class="sftp-connecting">
+      <div class="sftp-spinner"></div>
+      <span>연결 중...</span>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const headerEl = panel.querySelector(".sftp-header") as HTMLElement;
+  makeDraggableResizable(panel, headerEl);
+  bringToFront(panel);
+
+  let unlistenProgress: (() => void) | null = null;
+  let unlistenDrop: (() => void) | null = null;
+
+  const closePanel = async () => {
+    try { await invoke("sftp_disconnect", { sessionId }); } catch {}
+    if (unlistenProgress) unlistenProgress();
+    if (unlistenDrop) unlistenDrop();
+    panel.remove();
+  };
+  panel.querySelector(".sftp-close")!.addEventListener("click", closePanel);
+
+  // Progress tracking
+  const transfers = new Map<string, { bytes: number; total: number; direction: string }>();
+
+  const updateProgressUI = () => {
+    const area = panel.querySelector(".sftp-progress-area");
+    if (!area) return;
+    if (transfers.size === 0) { area.innerHTML = ""; return; }
+    area.innerHTML = Array.from(transfers.entries()).map(([filename, t]) => {
+      const pct = t.total > 0 ? Math.round(t.bytes / t.total * 100) : 0;
+      return `
+        <div class="sftp-progress-item">
+          <span class="sftp-progress-name">${t.direction === "upload" ? ICONS.upload : ICONS.download} ${escapeHtml(filename)}</span>
+          <div class="sftp-progress-bar"><div class="sftp-progress-fill" style="width:${pct}%"></div></div>
+          <span class="sftp-progress-pct">${pct}%</span>
+        </div>
+      `;
+    }).join("");
+  };
+
+  unlistenProgress = await listen<SftpProgress>("sftp-progress", (event) => {
+    const p = event.payload;
+    if (p.session_id !== sessionId) return;
+    transfers.set(p.filename, { bytes: p.bytes_transferred, total: p.total_bytes, direction: p.direction });
+    updateProgressUI();
+    if (p.bytes_transferred >= p.total_bytes) {
+      setTimeout(() => { transfers.delete(p.filename); updateProgressUI(); }, 1500);
+    }
+  });
+
+  // Connect
+  let currentDir: string;
+  try {
+    currentDir = await invoke<string>("sftp_connect", { sessionId });
+  } catch (e) {
+    panel.querySelector(".sftp-connecting")!.innerHTML = `<div class="sftp-error">연결 실패: ${e}</div>`;
+    return;
+  }
+
+  const homeDir = currentDir;
+  let sftpSortMode = "type";
+
+  const renderBrowser = () => {
+    const connecting = panel.querySelector(".sftp-connecting");
+    if (connecting) connecting.remove();
+
+    let existing = panel.querySelector(".sftp-body");
+    if (!existing) {
+      existing = document.createElement("div");
+      existing.className = "sftp-body";
+      panel.appendChild(existing);
+    }
+
+    existing.innerHTML = `
+      <div class="sftp-toolbar">
+        <div class="sftp-breadcrumb"></div>
+        <div class="sftp-actions">
+          <button class="btn-action btn-sftp sftp-dl-selected-btn" style="display:none">${ICONS.download} 다운로드</button>
+          <button class="btn-action btn-sftp sftp-upload-btn">${ICONS.upload} 업로드</button>
+          <button class="btn-action btn-sftp sftp-mkdir-btn">${ICONS.folderPlus} 폴더</button>
+          <select class="sftp-sort-select" title="정렬">
+            <option value="type">폴더순</option>
+            <option value="name">이름순</option>
+            <option value="modified">최근 수정순</option>
+            <option value="modified-asc">오래된순</option>
+            <option value="size">크기순</option>
+          </select>
+          <button class="btn-ghost sftp-refresh-btn" title="새로고침">${ICONS.refresh}</button>
+        </div>
+      </div>
+      <div class="sftp-file-list">
+        <div class="sftp-loading"><div class="sftp-spinner"></div></div>
+      </div>
+      <div class="sftp-drop-zone">파일을 여기에 드래그하여 업로드</div>
+      <div class="sftp-progress-area"></div>
+    `;
+
+    const sortSelect = panel.querySelector(".sftp-sort-select") as HTMLSelectElement;
+    sortSelect.value = sftpSortMode;
+    sortSelect.addEventListener("change", () => { sftpSortMode = sortSelect.value; loadDir(currentDir); });
+
+    panel.querySelector(".sftp-dl-selected-btn")!.addEventListener("click", async () => {
+      const checked = panel.querySelectorAll(".sftp-check:checked") as NodeListOf<HTMLInputElement>;
+      if (checked.length === 0) return;
+      const localDir = await open({ directory: true, title: "저장할 폴더 선택" });
+      if (!localDir) return;
+      for (const cb of checked) {
+        const remotePath = cb.dataset.sftpPath!;
+        const name = cb.dataset.sftpName!;
+        const localPath = (localDir as string).replace(/[/\\]$/, "") + "/" + name;
+        try { await invoke("sftp_download", { sessionId, remotePath, localPath }); }
+        catch (e) { customAlert("다운로드 실패: " + name + " - " + e); }
+      }
+      loadDir(currentDir);
+    });
+
+    panel.querySelector(".sftp-upload-btn")!.addEventListener("click", async () => {
+      const path = await open({ multiple: true });
+      if (!path) return;
+      const paths = Array.isArray(path) ? path : [path];
+      for (const p of paths) {
+        try {
+          await invoke("sftp_upload", { sessionId, remoteDir: currentDir, localPath: p });
+        } catch (e) { customAlert("업로드 실패: " + e); }
+      }
+      loadDir(currentDir);
+    });
+
+    panel.querySelector(".sftp-mkdir-btn")!.addEventListener("click", async () => {
+      const name = await customPrompt("폴더 이름:");
+      if (!name) return;
+      try {
+        await invoke("sftp_mkdir", { sessionId, path: currentDir + "/" + name });
+        loadDir(currentDir);
+      } catch (e) { customAlert("폴더 생성 실패: " + e); }
+    });
+
+    panel.querySelector(".sftp-refresh-btn")!.addEventListener("click", () => loadDir(currentDir));
+  };
+
+  const sftpTabComplete = async (value: string): Promise<TabResult> => {
+    let parentDir: string;
+    let partial: string;
+    if (value.endsWith("/")) {
+      // "/home/ec2-user/" -> list contents of /home/ec2-user
+      parentDir = value.replace(/\/+$/, "") || "/";
+      partial = "";
+    } else {
+      // "/home/ec2-u" -> list /home, filter by "ec2-u"
+      const lastSlash = value.lastIndexOf("/");
+      parentDir = lastSlash === 0 ? "/" : value.substring(0, lastSlash) || "/";
+      partial = value.substring(lastSlash + 1);
+    }
+    try {
+      const entries = await invoke<RemoteEntry[]>("sftp_list_dir", { sessionId, path: parentDir });
+      const dirs = entries.filter(e => e.is_dir && e.name.startsWith(partial));
+      if (dirs.length === 0) return { completed: null };
+      const prefix = parentDir === "/" ? "/" : parentDir + "/";
+      if (dirs.length === 1) return { completed: prefix + dirs[0].name + "/" };
+      // Find common prefix
+      let common = dirs[0].name;
+      for (let i = 1; i < dirs.length; i++) {
+        let j = 0;
+        while (j < common.length && j < dirs[i].name.length && common[j] === dirs[i].name[j]) j++;
+        common = common.substring(0, j);
+      }
+      const completed = common.length > partial.length ? prefix + common : null;
+      return { completed, candidates: dirs.map(d => d.name) };
+    } catch { return { completed: null }; }
+  };
+
+  const showBcDropdown = async (segmentEl: HTMLElement, dirPath: string) => {
+    // Remove any existing dropdown
+    document.querySelectorAll(".sftp-bc-dropdown").forEach(d => d.remove());
+
+    const dropdown = document.createElement("div");
+    dropdown.className = "sftp-bc-dropdown";
+    dropdown.innerHTML = `<div class="sftp-bc-dropdown-loading">불러오는 중...</div>`;
+    document.body.appendChild(dropdown);
+
+    // Position below the breadcrumb segment
+    const rect = segmentEl.getBoundingClientRect();
+    dropdown.style.left = rect.left + "px";
+    dropdown.style.top = (rect.bottom + 4) + "px";
+
+    // Close on outside click
+    const closeDropdown = (e: MouseEvent) => {
+      if (!dropdown.contains(e.target as Node)) {
+        dropdown.remove();
+        document.removeEventListener("mousedown", closeDropdown);
+      }
+    };
+    setTimeout(() => document.addEventListener("mousedown", closeDropdown), 0);
+
+    try {
+      const entries = await invoke<RemoteEntry[]>("sftp_list_dir", { sessionId, path: dirPath });
+      const dirs = entries.filter(e => e.is_dir);
+      if (dirs.length === 0) {
+        dropdown.innerHTML = `<div class="sftp-bc-dropdown-empty">하위 폴더 없음</div>`;
+        return;
+      }
+      dropdown.innerHTML = dirs.map(d =>
+        `<div class="sftp-bc-dropdown-item" data-path="${escapeHtml(d.path)}">${ICONS.folderOpen} ${escapeHtml(d.name)}</div>`
+      ).join("");
+      dropdown.querySelectorAll(".sftp-bc-dropdown-item").forEach(item => {
+        item.addEventListener("click", () => {
+          dropdown.remove();
+          document.removeEventListener("mousedown", closeDropdown);
+          loadDir((item as HTMLElement).dataset.path!);
+        });
+      });
+    } catch {
+      dropdown.innerHTML = `<div class="sftp-bc-dropdown-empty">로드 실패</div>`;
+    }
+  };
+
+  const renderBreadcrumb = () => {
+    const bc = panel.querySelector(".sftp-breadcrumb")!;
+    const parts = currentDir.split("/").filter(Boolean);
+    let html = "";
+    let path = "";
+    for (let i = 0; i < parts.length; i++) {
+      path += "/" + parts[i];
+      if (i > 0) html += `<span class="sftp-bc-sep">/</span>`;
+      html += `<span class="sftp-bc-item" data-path="${path}">${escapeHtml(parts[i])}</span>`;
+    }
+    html += `<button class="sftp-bc-goto" title="경로 직접 입력">${ICONS.edit}</button>`;
+    bc.innerHTML = html;
+    bc.querySelectorAll(".sftp-bc-item").forEach(el => {
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const segPath = (el as HTMLElement).dataset.path!;
+        showBcDropdown(el as HTMLElement, segPath);
+      });
+      el.addEventListener("dblclick", (e) => {
+        e.stopPropagation();
+        loadDir((el as HTMLElement).dataset.path!);
+      });
+    });
+    bc.querySelector(".sftp-bc-goto")!.addEventListener("click", async () => {
+      const target = await customPrompt("이동할 경로:", currentDir, { onTab: sftpTabComplete });
+      if (target) loadDir(target);
+    });
+  };
+
+  const loadDir = async (path: string) => {
+    const fileList = panel.querySelector(".sftp-file-list")!;
+    fileList.innerHTML = `<div class="sftp-loading"><div class="sftp-spinner"></div></div>`;
+    currentDir = path;
+    renderBreadcrumb();
+
+    try {
+      const entries = await invoke<RemoteEntry[]>("sftp_list_dir", { sessionId, path });
+
+      // Sort
+      entries.sort((a, b) => {
+        if (sftpSortMode === "type") return b.is_dir === a.is_dir ? a.name.toLowerCase().localeCompare(b.name.toLowerCase()) : b.is_dir ? 1 : -1;
+        if (sftpSortMode === "name") return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+        if (sftpSortMode === "modified") return b.modified - a.modified;
+        if (sftpSortMode === "modified-asc") return a.modified - b.modified;
+        if (sftpSortMode === "size") return b.size - a.size;
+        return 0;
+      });
+
+      let html = "";
+
+      if (path !== "/") {
+        const parent = path.replace(/\/[^/]+\/?$/, "") || "/";
+        html += `
+          <div class="sftp-row sftp-row-dir" data-sftp-path="${parent}" data-sftp-dir="true">
+            <div class="sftp-row-check"></div>
+            <div class="sftp-row-icon">${ICONS.arrowUp}</div>
+            <div class="sftp-row-name">..</div>
+            <div class="sftp-row-size"></div>
+            <div class="sftp-row-date"></div>
+            <div class="sftp-row-perm"></div>
+            <div class="sftp-row-actions"></div>
+          </div>
+        `;
+      }
+
+      for (const entry of entries) {
+        const icon = entry.is_dir ? ICONS.folderOpen : ICONS.file;
+        html += `
+          <div class="sftp-row ${entry.is_dir ? "sftp-row-dir" : "sftp-row-file"}" data-sftp-path="${escapeHtml(entry.path)}" data-sftp-dir="${entry.is_dir}">
+            <div class="sftp-row-check">${!entry.is_dir ? `<input type="checkbox" class="sftp-check" data-sftp-path="${escapeHtml(entry.path)}" data-sftp-name="${escapeHtml(entry.name)}" />` : ""}</div>
+            <div class="sftp-row-icon">${icon}</div>
+            <div class="sftp-row-name">${escapeHtml(entry.name)}</div>
+            <div class="sftp-row-size">${entry.is_dir ? "-" : humanizeSize(entry.size)}</div>
+            <div class="sftp-row-date">${formatDate(entry.modified)}</div>
+            <div class="sftp-row-perm">${entry.permissions}</div>
+            <div class="sftp-row-actions">
+              ${!entry.is_dir ? `<button class="btn-sm btn-sftp-dl" data-sftp-action="download" data-sftp-path="${escapeHtml(entry.path)}" data-sftp-name="${escapeHtml(entry.name)}" title="다운로드">${ICONS.download}</button>` : ""}
+              <button class="btn-sm btn-delete-sm" data-sftp-action="delete" data-sftp-path="${escapeHtml(entry.path)}" data-sftp-isdir="${entry.is_dir}" title="삭제">${ICONS.trash}</button>
+            </div>
+          </div>
+        `;
+      }
+
+      if (entries.length === 0) {
+        html += `<div class="sftp-empty">빈 디렉토리</div>`;
+      }
+
+      fileList.innerHTML = html;
+
+      // Checkbox -> show/hide multi-download button
+      const dlBtn = panel.querySelector(".sftp-dl-selected-btn") as HTMLElement;
+      fileList.querySelectorAll(".sftp-check").forEach(cb => {
+        cb.addEventListener("change", () => {
+          const anyChecked = panel.querySelectorAll(".sftp-check:checked").length > 0;
+          dlBtn.style.display = anyChecked ? "" : "none";
+        });
+      });
+
+      fileList.querySelectorAll(".sftp-row").forEach(row => {
+        row.addEventListener("click", (e) => {
+          if ((e.target as HTMLElement).closest("[data-sftp-action]")) return;
+          if ((e.target as HTMLElement).closest(".sftp-check")) return;
+          const el = row as HTMLElement;
+          if (el.dataset.sftpDir === "true") {
+            loadDir(el.dataset.sftpPath!);
+          } else {
+            // Toggle checkbox for file rows
+            const cb = el.querySelector(".sftp-check") as HTMLInputElement | null;
+            if (cb) {
+              cb.checked = !cb.checked;
+              cb.dispatchEvent(new Event("change"));
+            }
+          }
+        });
+      });
+
+      fileList.querySelectorAll("[data-sftp-action]").forEach(btn => {
+        btn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const el = btn as HTMLElement;
+          const action = el.dataset.sftpAction;
+          if (action === "download") {
+            const remotePath = el.dataset.sftpPath!;
+            const name = el.dataset.sftpName!;
+            const localPath = await save({ defaultPath: name });
+            if (!localPath) return;
+            try { await invoke("sftp_download", { sessionId, remotePath, localPath }); }
+            catch (e) { customAlert("다운로드 실패: " + e); }
+          } else if (action === "delete") {
+            const remotePath = el.dataset.sftpPath!;
+            const isDir = el.dataset.sftpIsdir === "true";
+            const ok = await customConfirm(`삭제할까요?\n${remotePath}`, "삭제");
+            if (!ok) return;
+            try { await invoke("sftp_delete", { sessionId, path: remotePath, isDir }); loadDir(currentDir); }
+            catch (e) { customAlert("삭제 실패: " + e); }
+          }
+        });
+      });
+    } catch (e) {
+      fileList.innerHTML = `<div class="sftp-error">디렉토리 로드 실패: ${e}</div>`;
+    }
+  };
+
+  // Drag & drop
+  unlistenDrop = await listen<{ paths: string[] }>("tauri://drag-drop", async (event) => {
+    if (!document.body.contains(panel)) return;
+    const paths = event.payload.paths;
+    if (!paths || paths.length === 0) return;
+    for (const p of paths) {
+      try { await invoke("sftp_upload", { sessionId, remoteDir: currentDir, localPath: p }); }
+      catch (e) { customAlert("업로드 실패: " + e); }
+    }
+    loadDir(currentDir);
+  });
+
+  listen("tauri://drag-enter", () => {
+    const zone = panel.querySelector(".sftp-drop-zone");
+    if (zone) zone.classList.add("sftp-drop-active");
+  });
+  listen("tauri://drag-leave", () => {
+    const zone = panel.querySelector(".sftp-drop-zone");
+    if (zone) zone.classList.remove("sftp-drop-active");
+  });
+  listen("tauri://drag-drop", () => {
+    const zone = panel.querySelector(".sftp-drop-zone");
+    if (zone) zone.classList.remove("sftp-drop-active");
+  });
+
+  renderBrowser();
+  loadDir(currentDir);
 }
 
 // --- Render ---
@@ -548,6 +1158,7 @@ function renderSessionRow(s: SshSession): string {
           <span class="toggle-mini-track"><span class="toggle-mini-thumb"></span></span>
         </label>
         <button class="btn-sm btn-connect-sm" data-action="connect" data-id="${s.id}" title="연결">${ICONS.terminal}</button>
+        <button class="btn-sm btn-sftp-sm" data-action="sftp" data-id="${s.id}" title="파일 관리">${ICONS.fileManager}</button>
         <button class="btn-sm btn-edit-sm" data-action="edit" data-id="${s.id}" title="편집">${ICONS.edit}</button>
         <button class="btn-sm btn-delete-sm" data-action="delete" data-id="${s.id}" title="삭제">${ICONS.trash}</button>
       </div>
@@ -697,6 +1308,8 @@ function renderShell() {
       editFolder(actionEl.dataset.folderId!);
     } else if (action === "add-in-folder") {
       openModal(undefined, actionEl.dataset.folderId!);
+    } else if (action === "sftp") {
+      openSftpPanel(actionEl.dataset.id!);
     }
   });
 
