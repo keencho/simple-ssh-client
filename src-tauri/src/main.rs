@@ -448,11 +448,16 @@ fn open_ssh(id: String, new_window: bool) -> Result<(), String> {
     fix_key_permissions(&session.key_file)?;
     if let Some(jump) = &session.jump_host { fix_key_permissions(&jump.key_file)?; }
     let ssh_cmd = build_ssh_command(session);
-    let title = &session.name;
+    let folder_name = session.folder_id.as_ref()
+        .and_then(|fid| data.folders.iter().find(|f| f.id == *fid))
+        .map(|f| f.name.as_str())
+        .unwrap_or("미분류");
+    let title = format!("{}:{}", folder_name, session.name);
+    let cmd_with_title = format!("title {} && {}", title, ssh_cmd);
     if new_window {
-        Command::new("wt.exe").args(["new-tab", "--title", title, "--", "cmd", "/k", &ssh_cmd]).spawn().map_err(|e| e.to_string())?;
+        Command::new("wt.exe").args(["new-tab", "--title", &title, "--suppressApplicationTitle", "--", "cmd", "/k", &cmd_with_title]).spawn().map_err(|e| e.to_string())?;
     } else {
-        Command::new("wt.exe").args(["-w", "0", "new-tab", "--title", title, "--", "cmd", "/k", &ssh_cmd]).spawn().map_err(|e| e.to_string())?;
+        Command::new("wt.exe").args(["-w", "ssh-manager", "new-tab", "--title", &title, "--suppressApplicationTitle", "--", "cmd", "/k", &cmd_with_title]).spawn().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
