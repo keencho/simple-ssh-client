@@ -312,10 +312,21 @@ body.dragging-divider, body.dragging-divider * {
 .pane-xterm {
   flex: 1;
   min-height: 0;
-  padding: 4px 0 0 6px;
+  padding: 4px 0 0 0;
 }
 
 .pane-xterm > .xterm { height: 100%; }
+
+.pane-xterm .xterm-screen {
+  box-sizing: content-box !important;
+  padding-left: 4px;
+}
+
+/* xterm-selection is position:absolute left:0 inside xterm-screen,
+   so we shift it right to match text which sits in the content area (x=4). */
+.pane-xterm .xterm-screen .xterm-selection {
+  left: 4px !important;
+}
 
 .pane-xterm > .xterm .xterm-viewport {
   background-color: var(--bg) !important;
