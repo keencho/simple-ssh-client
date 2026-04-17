@@ -1234,6 +1234,10 @@ function extractPaneToNewTab(srcTab: Tab, srcIdx: number) {
     srcTab.focusedPaneId = srcTab.panes[Math.min(srcIdx, srcTab.panes.length - 1)].id;
   }
   if (srcTab.zoomedPaneId === pane.id) srcTab.zoomedPaneId = null;
+  // Sync tab button title when collapsing back to a single pane
+  if (srcTab.panes.length === 1) {
+    (srcTab.tabBtnEl.querySelector(".tab-title") as HTMLElement).textContent = srcTab.panes[0].title;
+  }
   renderTabLayout(srcTab);
   applyFocusStyles(srcTab);
 
@@ -1397,12 +1401,20 @@ function movePaneAcrossTabs(srcTab: Tab, srcIdx: number, dstTab: Tab, dstIdx: nu
     normalizeRatios(srcTab);
     if (srcTab.focusedPaneId === pane.id) srcTab.focusedPaneId = srcTab.panes[Math.min(srcIdx, srcTab.panes.length - 1)].id;
     if (srcTab.zoomedPaneId === pane.id) srcTab.zoomedPaneId = null;
+    if (srcTab.panes.length === 1) {
+      (srcTab.tabBtnEl.querySelector(".tab-title") as HTMLElement).textContent = srcTab.panes[0].title;
+    }
     renderTabLayout(srcTab);
     applyFocusStyles(srcTab);
   }
   // Insert into dst. Pane event handlers resolve their current tab via findPane()
   // at call time, so no rewiring is needed after a move.
   dstTab.panes.splice(dstIdx, 0, pane);
+  // Rename only on actual collision within the destination tab
+  if (dstTab.panes.filter(p => p.title === pane.title).length > 1) {
+    pane.title = chooseTitle(pane.baseTitle);
+    (pane.headerEl.querySelector(".pane-header-title") as HTMLElement).textContent = pane.title;
+  }
   const share = 1 / (dstTab.panes.length);
   dstTab.ratios = dstTab.panes.map(() => share);
   dstTab.focusedPaneId = pane.id;
