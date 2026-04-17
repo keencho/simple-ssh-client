@@ -90,6 +90,7 @@ const ICONS = {
   server: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/></svg>`,
   drag: `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" opacity="0.4"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>`,
   fileManager: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
+  copy: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>`,
   upload: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
   download: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
   folderPlus: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>`,
@@ -154,7 +155,7 @@ function customAlert(message: string): Promise<void> {
     document.body.appendChild(overlay);
     const close = () => { overlay.remove(); resolve(); };
     overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", close);
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
     const esc = (e: KeyboardEvent) => { if (e.key === "Escape" || e.key === "Enter") { close(); document.removeEventListener("keydown", esc); } };
     document.addEventListener("keydown", esc);
     (overlay.querySelector(".dialog-btn-ok") as HTMLElement).focus();
@@ -179,7 +180,7 @@ function customConfirm(message: string, title?: string): Promise<boolean> {
     const close = (val: boolean) => { overlay.remove(); resolve(val); };
     overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", () => close(true));
     overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(false));
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(false); });
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(false); });
     const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { close(false); document.removeEventListener("keydown", esc); } };
     document.addEventListener("keydown", esc);
     (overlay.querySelector(".dialog-btn-ok") as HTMLElement).focus();
@@ -212,7 +213,7 @@ function customPrompt(message: string, defaultValue?: string, options?: { onTab?
     const close = (val: string | null) => { overlay.remove(); resolve(val); };
     overlay.querySelector(".dialog-btn-ok")!.addEventListener("click", () => close(input.value));
     overlay.querySelector(".dialog-btn-cancel")!.addEventListener("click", () => close(null));
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(null); });
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(null); });
 
     const hideSuggestions = () => { suggestionsEl.style.display = "none"; suggestionsEl.innerHTML = ""; };
 
@@ -600,7 +601,7 @@ async function openThemePicker() {
 
   const close = () => overlay.remove();
   overlay.querySelector("#theme-close")!.addEventListener("click", close);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
 
   const root = overlay.querySelector(".theme-groups") as HTMLElement;
   root.addEventListener("click", async (e) => {
@@ -710,7 +711,7 @@ function openModal(session?: SshSession, defaultFolderId?: string | null) {
   const close = () => overlay.remove();
   overlay.querySelector("#modal-close")!.addEventListener("click", close);
   overlay.querySelector("#modal-cancel")!.addEventListener("click", close);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
 
   const jumpCb = overlay.querySelector("#f-use-jump") as HTMLInputElement;
   const jumpSec = overlay.querySelector("#jump-section") as HTMLElement;
@@ -1268,6 +1269,7 @@ function renderSessionRow(s: SshSession): string {
         </label>
         <button class="btn-sm btn-connect-sm" data-action="connect" data-id="${s.id}" title="연결">${ICONS.terminal}</button>
         <button class="btn-sm btn-sftp-sm" data-action="sftp" data-id="${s.id}" title="파일 관리">${ICONS.fileManager}</button>
+        <button class="btn-sm btn-copy-sm" data-action="copy" data-id="${s.id}" title="복사">${ICONS.copy}</button>
         <button class="btn-sm btn-edit-sm" data-action="edit" data-id="${s.id}" title="편집">${ICONS.edit}</button>
         <button class="btn-sm btn-delete-sm" data-action="delete" data-id="${s.id}" title="삭제">${ICONS.trash}</button>
       </div>
@@ -1390,7 +1392,7 @@ function renderShell() {
   // Event delegation
   const contentArea = document.getElementById("content-area")!;
 
-  contentArea.addEventListener("click", (e) => {
+  contentArea.addEventListener("click", async (e) => {
     if (dndJustFinished) return;
 
     const folderHeader = (e.target as HTMLElement).closest("[data-folder-toggle]") as HTMLElement | null;
@@ -1413,6 +1415,11 @@ function renderShell() {
     } else if (action === "edit") {
       const s = data.sessions.find((s) => s.id === actionEl.dataset.id);
       if (s) openModal(s);
+    } else if (action === "copy") {
+      try {
+        data = await invoke<SessionsData>("copy_session", { id: actionEl.dataset.id });
+        renderTree(); renderStats();
+      } catch (e) { customAlert("복사 실패: " + e); }
     } else if (action === "delete") {
       deleteSession(actionEl.dataset.id!);
     } else if (action === "edit-folder") {

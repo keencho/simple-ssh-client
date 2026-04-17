@@ -1128,7 +1128,7 @@ async function openSessionPickerForSplit() {
 
   const close = () => overlay.remove();
   overlay.querySelector(".picker-close")!.addEventListener("click", close);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
 
   searchEl.addEventListener("input", () => renderList(searchEl.value));
 

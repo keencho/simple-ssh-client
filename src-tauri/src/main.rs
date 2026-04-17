@@ -436,6 +436,31 @@ fn delete_folder(id: String) -> Result<SessionsData, String> {
 }
 
 #[tauri::command]
+fn copy_session(id: String) -> Result<SessionsData, String> {
+    let mut data = load_data()?;
+    let original = data.sessions.iter().find(|s| s.id == id).cloned().ok_or("Session not found")?;
+    // Shift all sessions in the same folder with order > original.order to make room
+    for s in data.sessions.iter_mut() {
+        if s.folder_id == original.folder_id && s.order > original.order {
+            s.order += 1;
+        }
+    }
+    data.sessions.push(SshSession {
+        id: Uuid::new_v4().to_string(),
+        name: format!("{} (복사)", original.name),
+        host: original.host,
+        port: original.port,
+        user: original.user,
+        key_file: original.key_file,
+        folder_id: original.folder_id,
+        order: original.order + 1,
+        jump_host: original.jump_host,
+    });
+    save_data(&data)?;
+    Ok(data)
+}
+
+#[tauri::command]
 fn reorder_sessions(sessions: Vec<SshSession>) -> Result<SessionsData, String> {
     let mut data = load_data()?;
     let order_map: HashMap<String, (u32, Option<String>)> = sessions.into_iter().map(|s| (s.id.clone(), (s.order, s.folder_id))).collect();
@@ -927,7 +952,7 @@ fn main() {
             runtime,
         })
         .invoke_handler(tauri::generate_handler![
-            get_all_data, create_session, update_session, delete_session,
+            get_all_data, create_session, update_session, delete_session, copy_session,
             create_folder, update_folder, delete_folder,
             reorder_sessions, reorder_folders, open_ssh,
             sftp_connect, sftp_disconnect, sftp_list_dir,

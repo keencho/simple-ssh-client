@@ -164,6 +164,11 @@ header {
   color: var(--accent);
 }
 
+.btn-copy-sm:hover {
+  background: rgba(240, 154, 50, 0.15);
+  color: var(--orange);
+}
+
 .btn-edit-sm:hover {
   background: rgba(69, 147, 252, 0.15);
   color: var(--blue);
