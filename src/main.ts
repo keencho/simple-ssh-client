@@ -1,6 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save, confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { THEMES, THEME_ORDER, THEME_GROUPS, DEFAULT_THEME, type TerminalTheme } from "./themes";
+
+// Block browser default context menu (Inspect / Reload / etc.)
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// Route by window label: terminal windows load a different module
+const IS_TERMINAL_WINDOW = getCurrentWindow().label.startsWith("term-");
+if (IS_TERMINAL_WINDOW) {
+  void import("./terminal");
+}
 
 // --- Types ---
 
@@ -64,6 +75,8 @@ let globalNewWindow = false;
 const ICONS = {
   search: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>`,
   refresh: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15"/></svg>`,
+  palette: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 2a10 10 0 100 20c1.38 0 2.5-1.12 2.5-2.5 0-.61-.23-1.16-.6-1.58-.36-.42-.59-.96-.59-1.56 0-1.38 1.12-2.5 2.5-2.5H18a4 4 0 004-4 8 8 0 00-10-8z"/><circle cx="6.5" cy="12.5" r="1.1" fill="currentColor"/><circle cx="9.5" cy="7.5" r="1.1" fill="currentColor"/><circle cx="14.5" cy="7.5" r="1.1" fill="currentColor"/><circle cx="17.5" cy="11.5" r="1.1" fill="currentColor"/></svg>`,
+  check: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
   plus: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>`,
   edit: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`,
   trash: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14"/></svg>`,
@@ -527,6 +540,91 @@ function initDnD() {
 }
 
 // --- Modal ---
+
+async function openThemePicker() {
+  const currentName: string = (await invoke<string | null>("get_terminal_theme")) ?? DEFAULT_THEME;
+
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+
+  let selectedName = currentName;
+  let rankMap = new Map<string, number>();
+  THEME_ORDER.forEach((n, i) => rankMap.set(n, i + 1));
+
+  const renderCard = (t: TerminalTheme) => {
+    const x = t.xterm;
+    const selected = t.name === selectedName;
+    const rank = rankMap.get(t.name) ?? 0;
+    const swatches = [x.red, x.green, x.yellow, x.blue, x.magenta, x.cyan]
+      .map(c => `<span class="theme-dot" style="background:${c}"></span>`).join("");
+    return `
+      <div class="theme-card ${selected ? "selected" : ""}" data-theme-name="${t.name}" style="background:${x.background}; border-color:${selected ? t.ui.accent : "transparent"}">
+        <div class="theme-card-rank" style="color:${t.ui.fgDim}; border-color:${t.ui.border}">#${rank}</div>
+        <div class="theme-card-header">
+          <span class="theme-card-title" style="color:${x.foreground}">${escapeHtml(t.displayName)}</span>
+          <span class="theme-card-check" style="color:${t.ui.accent}; ${selected ? "" : "visibility:hidden"}">${ICONS.check}</span>
+        </div>
+        <div class="theme-card-sample" style="color:${x.foreground}">
+          <div><span style="color:${x.green}">$</span> <span style="color:${x.blue}">ls</span> <span style="color:${x.cyan}">-la</span></div>
+          <div><span style="color:${x.magenta}">drwxr-xr-x</span> <span style="color:${x.foreground}">user</span> <span style="color:${x.yellow}">docs</span></div>
+        </div>
+        <div class="theme-card-dots">${swatches}</div>
+        <div class="theme-card-blurb">${escapeHtml(t.blurb)}</div>
+      </div>
+    `;
+  };
+
+  const renderGroup = (g: { label: string; names: string[] }) => `
+    <div class="theme-group">
+      <div class="theme-group-header">
+        <span class="theme-group-label">${escapeHtml(g.label)}</span>
+        <span class="theme-group-count">${g.names.length}</span>
+      </div>
+      <div class="theme-grid">
+        ${g.names.map(n => renderCard(THEMES[n])).join("")}
+      </div>
+    </div>
+  `;
+
+  overlay.innerHTML = `
+    <div class="modal modal-theme">
+      <button class="modal-close" id="theme-close">${ICONS.close}</button>
+      <div class="modal-title">터미널 테마</div>
+      <div class="modal-subtitle">랭킹 순 · 선택하면 열려있는 모든 터미널 창에 즉시 적용됩니다.</div>
+      <div class="theme-groups">
+        ${THEME_GROUPS.map(renderGroup).join("")}
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  overlay.querySelector("#theme-close")!.addEventListener("click", close);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+
+  const root = overlay.querySelector(".theme-groups") as HTMLElement;
+  root.addEventListener("click", async (e) => {
+    const card = (e.target as HTMLElement).closest(".theme-card") as HTMLElement | null;
+    if (!card) return;
+    const name = card.dataset.themeName!;
+    if (name === selectedName) return;
+    selectedName = name;
+    // Update selected state across all cards
+    root.querySelectorAll(".theme-card").forEach(el => {
+      const cardName = (el as HTMLElement).dataset.themeName!;
+      const isActive = cardName === name;
+      el.classList.toggle("selected", isActive);
+      const check = el.querySelector(".theme-card-check") as HTMLElement;
+      if (check) check.style.visibility = isActive ? "" : "hidden";
+      (el as HTMLElement).style.borderColor = isActive ? THEMES[cardName].ui.accent : "transparent";
+    });
+    try { await invoke("set_terminal_theme", { name }); }
+    catch (err) { customAlert("테마 적용 실패: " + err); }
+  });
+
+  const esc = (e: KeyboardEvent) => { if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); } };
+  document.addEventListener("keydown", esc);
+}
 
 function openModal(session?: SshSession, defaultFolderId?: string | null) {
   const isEdit = !!session;
@@ -1268,6 +1366,7 @@ function renderShell() {
             <span class="toggle-track"><span class="toggle-thumb"></span></span>
             <span class="toggle-text-label">New Window</span>
           </label>
+          <button class="btn-ghost" id="theme-btn" title="터미널 테마">${ICONS.palette}</button>
           <button class="btn-ghost" id="refresh-btn" title="새로고침">${ICONS.refresh}</button>
         </div>
         <div class="stats" id="stats"></div>
@@ -1281,6 +1380,7 @@ function renderShell() {
 
   document.getElementById("add-session-btn")!.addEventListener("click", () => openModal());
   document.getElementById("add-folder-btn")!.addEventListener("click", addFolder);
+  document.getElementById("theme-btn")!.addEventListener("click", () => void openThemePicker());
   document.getElementById("refresh-btn")!.addEventListener("click", loadData);
 
   (document.getElementById("global-newwin") as HTMLInputElement).addEventListener("change", (e) => {
@@ -1339,7 +1439,9 @@ function renderShell() {
   renderTree();
 }
 
-(async () => {
-  renderShell();
-  await loadData();
-})();
+if (!IS_TERMINAL_WINDOW) {
+  (async () => {
+    renderShell();
+    await loadData();
+  })();
+}

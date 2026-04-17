@@ -3,12 +3,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use russh_keys::ssh_key;
 use uuid::Uuid;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -94,8 +96,38 @@ struct SftpHandle {
     tx: tokio::sync::mpsc::Sender<SftpCommand>,
 }
 
+struct PtyInstance {
+    master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+#[derive(Clone, Serialize)]
+struct PtyOutputPayload {
+    terminal_id: String,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Serialize)]
+struct PtyExitPayload {
+    terminal_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AddTabPayload {
+    terminal_id: String,
+    title: String,
+    ssh_args: Vec<String>,
+    #[serde(default)]
+    adopt: bool,
+    #[serde(default)]
+    initial_content: String,
+}
+
 struct AppState {
     sftp_connections: Mutex<HashMap<String, SftpHandle>>,
+    ptys: Mutex<HashMap<String, Arc<PtyInstance>>>,
+    pending_tabs: Mutex<HashMap<String, AddTabPayload>>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -328,16 +360,21 @@ fn save_data(data: &SessionsData) -> Result<(), String> {
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
-fn build_ssh_command(session: &SshSession) -> String {
-    let mut cmd = String::from("ssh");
+fn build_ssh_args(session: &SshSession) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
     if let Some(jump) = &session.jump_host {
-        cmd.push_str(&format!(
-            " -o \"ProxyCommand=ssh -i \\\"{}\\\" -W %h:%p -p {} {}@{}\"",
+        args.push("-o".to_string());
+        args.push(format!(
+            "ProxyCommand=ssh -i \"{}\" -W %h:%p -p {} {}@{}",
             jump.key_file, jump.port, jump.user, jump.host
         ));
     }
-    cmd.push_str(&format!(" -i \"{}\" -p {} {}@{}", session.key_file, session.port, session.user, session.host));
-    cmd
+    args.push("-i".to_string());
+    args.push(session.key_file.clone());
+    args.push("-p".to_string());
+    args.push(session.port.to_string());
+    args.push(format!("{}@{}", session.user, session.host));
+    args
 }
 
 // --- Tauri Commands ---
@@ -441,23 +478,329 @@ fn fix_key_permissions(key_path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_ssh(id: String, new_window: bool) -> Result<(), String> {
-    use std::process::Command;
+async fn open_ssh(id: String, new_window: bool, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let data = load_data()?;
+    let session = data.sessions.iter().find(|s| s.id == id).cloned().ok_or("Session not found")?;
+    fix_key_permissions(&session.key_file)?;
+    if let Some(jump) = &session.jump_host { fix_key_permissions(&jump.key_file)?; }
+
+    let folder_name = session.folder_id.as_ref()
+        .and_then(|fid| data.folders.iter().find(|f| f.id == *fid))
+        .map(|f| f.name.clone())
+        .unwrap_or_else(|| "미분류".to_string());
+    let title = format!("{}:{}", folder_name, session.name);
+    let ssh_args = build_ssh_args(&session);
+    let terminal_id = Uuid::new_v4().to_string();
+    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, adopt: false, initial_content: String::new() };
+
+    let existing_label = if new_window {
+        None
+    } else {
+        app.webview_windows()
+            .keys()
+            .find(|label| label.starts_with("term-"))
+            .cloned()
+    };
+
+    if let Some(label) = existing_label {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            window.emit_to(label.as_str(), "add-tab", payload)
+                .map_err(|e| e.to_string())?;
+        }
+    } else {
+        let label = format!("term-{}", Uuid::new_v4().simple());
+        state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+        let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+            .title(title.clone())
+            .inner_size(1100.0, 720.0)
+            .min_inner_size(640.0, 400.0)
+            .resizable(true)
+            .disable_drag_drop_handler();
+        builder.build().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_take_pending(window_label: String, state: State<AppState>) -> Option<AddTabPayload> {
+    state.pending_tabs.lock().unwrap().remove(&window_label)
+}
+
+#[derive(Serialize)]
+struct SessionArgs {
+    title: String,
+    ssh_args: Vec<String>,
+}
+
+#[tauri::command]
+fn get_ssh_args_for_session(id: String) -> Result<SessionArgs, String> {
     let data = load_data()?;
     let session = data.sessions.iter().find(|s| s.id == id).ok_or("Session not found")?;
     fix_key_permissions(&session.key_file)?;
     if let Some(jump) = &session.jump_host { fix_key_permissions(&jump.key_file)?; }
-    let ssh_cmd = build_ssh_command(session);
     let folder_name = session.folder_id.as_ref()
         .and_then(|fid| data.folders.iter().find(|f| f.id == *fid))
-        .map(|f| f.name.as_str())
-        .unwrap_or("미분류");
-    let title = format!("{}:{}", folder_name, session.name);
-    let cmd_with_title = format!("title {} && {}", title, ssh_cmd);
+        .map(|f| f.name.clone())
+        .unwrap_or_else(|| "미분류".to_string());
+    Ok(SessionArgs {
+        title: format!("{}:{}", folder_name, session.name),
+        ssh_args: build_ssh_args(session),
+    })
+}
+
+/// Spawn a new SSH terminal from raw ssh args. Used for "duplicate tab" — same
+/// host/user/key but a fresh connection (PTYs cannot be forked).
+#[tauri::command]
+async fn spawn_terminal(
+    ssh_args: Vec<String>,
+    title: String,
+    new_window: bool,
+    source_label: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let terminal_id = Uuid::new_v4().to_string();
+    let payload = AddTabPayload {
+        terminal_id,
+        title: title.clone(),
+        ssh_args,
+        adopt: false,
+        initial_content: String::new(),
+    };
+
     if new_window {
-        Command::new("wt.exe").args(["new-tab", "--title", &title, "--suppressApplicationTitle", "--", "cmd", "/k", &cmd_with_title]).spawn().map_err(|e| e.to_string())?;
-    } else {
-        Command::new("wt.exe").args(["-w", "ssh-manager", "new-tab", "--title", &title, "--suppressApplicationTitle", "--", "cmd", "/k", &cmd_with_title]).spawn().map_err(|e| e.to_string())?;
+        let label = format!("term-{}", Uuid::new_v4().simple());
+        state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+        let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+            .title(title)
+            .inner_size(1100.0, 720.0)
+            .min_inner_size(640.0, 400.0)
+            .resizable(true)
+            .disable_drag_drop_handler();
+        builder.build().map_err(|e| e.to_string())?;
+    } else if let Some(window) = app.get_webview_window(&source_label) {
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        window.emit_to(source_label.as_str(), "add-tab", payload)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// --- Config (for persisted preferences like terminal theme) ---
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppConfig {
+    #[serde(default)]
+    terminal_theme: Option<String>,
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    Ok(get_data_dir()?.join("config.json"))
+}
+
+fn load_config() -> AppConfig {
+    let Ok(p) = config_path() else { return AppConfig::default() };
+    fs::read_to_string(p).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(cfg: &AppConfig) -> Result<(), String> {
+    let p = config_path()?;
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    fs::write(p, json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_terminal_theme() -> Option<String> {
+    load_config().terminal_theme
+}
+
+#[tauri::command]
+fn set_terminal_theme(name: String, app: AppHandle) -> Result<(), String> {
+    let mut cfg = load_config();
+    cfg.terminal_theme = Some(name.clone());
+    save_config(&cfg)?;
+    // Broadcast to every window (session list + all terminals)
+    app.emit("terminal-theme-changed", name).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+struct MergeTabPayload {
+    terminal_id: String,
+    title: String,
+    ssh_args: Vec<String>,
+    initial_content: String,
+    screen_x: f64,
+    screen_y: f64,
+}
+
+#[tauri::command]
+async fn drop_tab(
+    source_label: String,
+    terminal_id: String,
+    title: String,
+    ssh_args: Vec<String>,
+    initial_content: String,
+    screen_x: f64,
+    screen_y: f64,
+    is_last_tab: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    // Try to find a target terminal window whose outer rect contains the cursor.
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with("term-") { continue; }
+        if label == source_label { continue; }
+        let Ok(pos) = window.outer_position() else { continue };
+        let Ok(size) = window.outer_size() else { continue };
+        let Ok(scale) = window.scale_factor() else { continue };
+        let x0 = pos.x as f64 / scale;
+        let y0 = pos.y as f64 / scale;
+        let x1 = x0 + size.width as f64 / scale;
+        let y1 = y0 + size.height as f64 / scale;
+        if screen_x >= x0 && screen_x < x1 && screen_y >= y0 && screen_y < y1 {
+            let merge = MergeTabPayload {
+                terminal_id,
+                title,
+                ssh_args,
+                initial_content,
+                screen_x,
+                screen_y,
+            };
+            window.emit_to(label.as_str(), "merge-tab", merge).map_err(|e| e.to_string())?;
+            let _ = window.set_focus();
+            return Ok(true);
+        }
+    }
+    // No merge target. If this is the source's last tab, "detach" would just
+    // relocate an identical window — pointless. Bail so the source keeps the tab.
+    if is_last_tab {
+        return Ok(false);
+    }
+    let label = format!("term-{}", Uuid::new_v4().simple());
+    let payload = AddTabPayload {
+        terminal_id,
+        title: title.clone(),
+        ssh_args,
+        adopt: true,
+        initial_content,
+    };
+    state.pending_tabs.lock().unwrap().insert(label.clone(), payload);
+    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+        .title(title.clone())
+        .inner_size(1100.0, 720.0)
+        .min_inner_size(640.0, 400.0)
+        .resizable(true)
+        .position(screen_x - 100.0, screen_y - 20.0)
+        .disable_drag_drop_handler();
+    builder.build().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+// --- PTY Commands ---
+
+#[tauri::command]
+fn pty_spawn(
+    terminal_id: String,
+    ssh_args: Vec<String>,
+    rows: u16,
+    cols: u16,
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("openpty failed: {}", e))?;
+
+    let mut cmd = CommandBuilder::new("ssh.exe");
+    for a in &ssh_args {
+        cmd.arg(a);
+    }
+    // Ensure ssh thinks stdout is a TTY
+    cmd.env("TERM", "xterm-256color");
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn failed: {}", e))?;
+    // Drop slave so EOF propagates when child exits
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("clone reader failed: {}", e))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("take writer failed: {}", e))?;
+
+    let instance = Arc::new(PtyInstance {
+        master: Mutex::new(pair.master),
+        writer: Mutex::new(writer),
+        child: Mutex::new(child),
+    });
+    state.ptys.lock().unwrap().insert(terminal_id.clone(), instance);
+
+    let app_clone = app.clone();
+    let tid = terminal_id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let _ = app_clone.emit(
+                        "pty-output",
+                        PtyOutputPayload {
+                            terminal_id: tid.clone(),
+                            data: buf[..n].to_vec(),
+                        },
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = app_clone.emit("pty-exit", PtyExitPayload { terminal_id: tid });
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_write(terminal_id: String, data: Vec<u8>, state: State<AppState>) -> Result<(), String> {
+    let ptys = state.ptys.lock().unwrap();
+    let pty = ptys.get(&terminal_id).ok_or("Unknown terminal")?.clone();
+    drop(ptys);
+    let mut w = pty.writer.lock().unwrap();
+    w.write_all(&data).map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_resize(terminal_id: String, rows: u16, cols: u16, state: State<AppState>) -> Result<(), String> {
+    let ptys = state.ptys.lock().unwrap();
+    let pty = ptys.get(&terminal_id).ok_or("Unknown terminal")?.clone();
+    drop(ptys);
+    pty.master
+        .lock()
+        .unwrap()
+        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_kill(terminal_id: String, state: State<AppState>) -> Result<(), String> {
+    let pty = state.ptys.lock().unwrap().remove(&terminal_id);
+    if let Some(pty) = pty {
+        let _ = pty.child.lock().unwrap().kill();
     }
     Ok(())
 }
@@ -579,6 +922,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sftp_connections: Mutex::new(HashMap::new()),
+            ptys: Mutex::new(HashMap::new()),
+            pending_tabs: Mutex::new(HashMap::new()),
             runtime,
         })
         .invoke_handler(tauri::generate_handler![
@@ -586,7 +931,10 @@ fn main() {
             create_folder, update_folder, delete_folder,
             reorder_sessions, reorder_folders, open_ssh,
             sftp_connect, sftp_disconnect, sftp_list_dir,
-            sftp_upload, sftp_download, sftp_mkdir, sftp_delete
+            sftp_upload, sftp_download, sftp_mkdir, sftp_delete,
+            pty_spawn, pty_write, pty_resize, pty_kill, pty_take_pending, drop_tab,
+            spawn_terminal, get_ssh_args_for_session,
+            get_terminal_theme, set_terminal_theme
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

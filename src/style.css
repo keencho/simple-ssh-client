@@ -485,6 +485,139 @@ body.dnd-active * {
   color: var(--text);
 }
 
+/* --- Theme picker modal --- */
+
+.modal-theme {
+  width: 900px;
+  max-width: 94vw;
+  padding: 24px 24px 20px;
+}
+
+.modal-subtitle {
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  margin: -18px 0 18px;
+}
+
+.theme-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.theme-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.theme-group-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+
+.theme-group-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.theme-card {
+  position: relative;
+  border: 2px solid transparent;
+  border-radius: 10px;
+  padding: 12px 14px 10px;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+}
+
+.theme-card-rank {
+  position: absolute;
+  top: 8px;
+  right: 34px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  opacity: 0.55;
+  letter-spacing: 0.02em;
+}
+
+.theme-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.theme-card.selected {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.theme-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.theme-card-title {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.theme-card-check { display: flex; align-items: center; }
+.theme-card-check svg { display: block; }
+
+.theme-card-sample {
+  font-size: 11px;
+  line-height: 1.45;
+  opacity: 0.95;
+  padding: 6px 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.theme-card-dots {
+  display: flex;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.theme-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.theme-card-blurb {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+  margin-top: 8px;
+  line-height: 1.3;
+}
+
 .form-group {
   margin-bottom: 16px;
 }
