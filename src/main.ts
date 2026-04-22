@@ -1323,7 +1323,11 @@ function bringToFront(panel: HTMLElement) {
   panel.style.zIndex = String(maxZ + 1);
 }
 
-async function openSftpPanel(sessionId: string) {
+// Exposed to terminal.ts (which lives in a sibling module) for the terminal
+// pane right-click menu's "SFTP 열기 (현재 경로)" item.
+(window as any).__sshmgr_openSftpPanel = (sid: string, dir?: string) => openSftpPanel(sid, dir);
+
+async function openSftpPanel(sessionId: string, initialDir?: string) {
   const session = data.sessions.find(s => s.id === sessionId);
   if (!session) return;
 
@@ -1731,7 +1735,7 @@ async function openSftpPanel(sessionId: string) {
   });
 
   renderBrowser();
-  loadDir(currentDir);
+  loadDir(initialDir || currentDir);
 }
 
 // --- Render ---

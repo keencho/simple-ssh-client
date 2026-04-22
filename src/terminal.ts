@@ -43,6 +43,7 @@ interface AddTabPayload {
   terminal_id: string;
   title: string;
   ssh_args: string[];
+  session_id?: string | null;
   adopt?: boolean;
   initial_content?: string;
 }
@@ -52,6 +53,8 @@ interface Pane {
   baseTitle: string;
   title: string;
   sshArgs: string[];
+  sessionId: string | null;  // sidebar session id (for SFTP-at-cwd lookup)
+  cwd: string | null;        // tracked from OSC 7 / window title
   fontSize: number;
   paneEl: HTMLElement;
   headerEl: HTMLElement;
@@ -77,6 +80,7 @@ interface MergeTabPayload {
   terminal_id: string;
   title: string;
   ssh_args: string[];
+  session_id?: string | null;
   initial_content: string;
   screen_x: number;
   screen_y: number;
@@ -89,6 +93,31 @@ interface PtyExit { terminal_id: string; }
 const tabs = new Map<string, Tab>();
 let activeTabId: string | null = null;
 const pendingOutput = new Map<string, Uint8Array[]>();
+
+// Per-session SFTP home dir cache. Populated lazily the first time a pane in
+// that session emits a "~" title (we ask Rust to resolve home via SFTP, then
+// re-evaluate later titles). Keyed by sidebar session_id.
+const sessionHomeCache = new Map<string, string>();
+const sessionHomeInflight = new Set<string>();
+function triggerHomeFetch(sessionId: string | null | undefined) {
+  if (!sessionId || sessionHomeCache.has(sessionId) || sessionHomeInflight.has(sessionId)) return;
+  sessionHomeInflight.add(sessionId);
+  invoke<string>("get_session_home", { sessionId })
+    .then((home) => { if (home) sessionHomeCache.set(sessionId, home); })
+    .catch(() => {})
+    .finally(() => sessionHomeInflight.delete(sessionId));
+}
+
+// Expose a tiny lookup so main.ts (sidebar context menu) can ask:
+// "is there an active pane for this session, and if so what's its cwd?"
+(window as any).__sshmgr_findCwdForSession = (sid: string): string | null => {
+  for (const tab of tabs.values()) {
+    for (const p of tab.panes) {
+      if (p.sessionId === sid && p.cwd) return p.cwd;
+    }
+  }
+  return null;
+};
 
 const MAX_PANES_PER_TAB = 3;
 const FONT_MIN = 8;
@@ -289,7 +318,7 @@ function applyFocusStyles(tab: Tab) {
 // ---------- Pane creation ----------
 // NOTE: handlers below look up the owning tab via findPane() each time, so a pane
 // can be moved between tabs and still behave correctly (focus, broadcast, zoom).
-function createPane(init: { id: string; baseTitle: string; title: string; sshArgs: string[] }): Pane {
+function createPane(init: { id: string; baseTitle: string; title: string; sshArgs: string[]; sessionId: string | null }): Pane {
   const paneEl = document.createElement("div");
   paneEl.className = "term-pane";
   paneEl.dataset.paneId = init.id;
@@ -337,11 +366,40 @@ function createPane(init: { id: string; baseTitle: string; title: string; sshArg
     baseTitle: init.baseTitle,
     title: init.title,
     sshArgs: init.sshArgs,
+    sessionId: init.sessionId,
+    cwd: null,
     fontSize: FONT_DEFAULT,
     paneEl, headerEl, xtermEl,
     term, fit, serialize,
     exited: false,
   };
+
+  // ---- cwd tracking (passive: no commands sent to remote shell) ----
+  // OSC 7: \e]7;file://<host>/<path>\a — modern shells configured with
+  // PROMPT_COMMAND (vte.sh, zsh's default on macOS, etc.) emit this on every
+  // prompt. Most accurate signal.
+  term.parser.registerOscHandler(7, (data) => {
+    const m = data.match(/^file:\/\/[^/]*(\/.*)$/);
+    if (m) {
+      try { pane.cwd = decodeURIComponent(m[1]); } catch { pane.cwd = m[1]; }
+    }
+    return false;  // let other handlers see it too
+  });
+  // Window title: OSC 0/2. Default Ubuntu/Debian/many distros' /etc/bash.bashrc
+  // sets PS1 to include "\[\e]0;\u@\h: \w\a\]" → title becomes "user@host: ~/path".
+  // Less precise (uses ~ for home) but very widely available.
+  term.onTitleChange((title) => {
+    const m = title.match(/^[^:@\s]+@[^:]+:\s*(.+)$/);
+    if (!m) return;
+    let path = m[1].trim();
+    if (path.startsWith("~")) {
+      // Resolve ~ via this pane's session SFTP home (lazily fetched once).
+      const home = sessionHomeCache.get(init.sessionId ?? "");
+      if (home) path = home + path.slice(1);
+      else { triggerHomeFetch(init.sessionId); return; }
+    }
+    if (path.startsWith("/")) pane.cwd = path;
+  });
 
   // Focus on click anywhere in pane (resolve current tab dynamically)
   paneEl.addEventListener("mousedown", () => {
@@ -450,6 +508,7 @@ async function addTab(payload: AddTabPayload) {
     baseTitle,
     title: displayTitle,
     sshArgs: payload.ssh_args,
+    sessionId: payload.session_id ?? null,
   });
   tab.panes.push(pane);
   tab.ratios.push(1);
@@ -537,7 +596,7 @@ async function splitTab(tab: Tab, from: Pane, sshArgs: string[], baseTitle: stri
 
   const newId = uid();
   const displayTitle = chooseTitle(baseTitle);
-  const pane = createPane({ id: newId, baseTitle, title: displayTitle, sshArgs });
+  const pane = createPane({ id: newId, baseTitle, title: displayTitle, sshArgs, sessionId: from.sessionId });
 
   const insertIdx = tab.panes.indexOf(from) + 1;
   tab.panes.splice(insertIdx, 0, pane);
@@ -1027,6 +1086,7 @@ async function dropTab(tabId: string, screenX: number, screenY: number) {
       terminalId: fp.id,
       title: fp.baseTitle,
       sshArgs: fp.sshArgs,
+      sessionId: fp.sessionId,
       initialContent: content,
       screenX, screenY,
       isLastTab: tabs.size === 1,
@@ -1061,6 +1121,7 @@ listen<MergeTabPayload>("merge-tab", async (event) => {
     terminal_id: p.terminal_id,
     title: p.title,
     ssh_args: p.ssh_args,
+    session_id: p.session_id ?? null,
     adopt: true,
     initial_content: p.initial_content,
   });
@@ -1175,6 +1236,17 @@ termsEl.addEventListener("contextmenu", (e) => {
     items.push({ label: "세로로 분할 (다른 세션...)", action: () => openSessionPickerForSplit() });
     items.push({ label: "-", action: () => {} });
   }
+  if (pane.sessionId) {
+    const openSftp = (window as any).__sshmgr_openSftpPanel as ((sid: string, dir?: string) => void) | undefined;
+    if (openSftp) {
+      if (pane.cwd) {
+        const display = pane.cwd.length > 40 ? "..." + pane.cwd.slice(-37) : pane.cwd;
+        items.push({ label: `SFTP 열기 (${display})`, action: () => openSftp(pane.sessionId!, pane.cwd!) });
+      }
+      items.push({ label: "SFTP 열기 (홈)", action: () => openSftp(pane.sessionId!) });
+      items.push({ label: "-", action: () => {} });
+    }
+  }
   items.push({ label: tab.zoomedPaneId === paneId ? "전체화면 해제" : "전체화면", action: () => toggleZoomForPane(tab, paneId) });
   items.push({ label: "-", action: () => {} });
   items.push({ label: "pane 닫기", action: () => void closePane(paneId), danger: true });
@@ -1190,6 +1262,7 @@ async function duplicateFromPane(pane: Pane, newWindow: boolean) {
       title: pane.baseTitle,
       newWindow,
       sourceLabel: myLabel,
+      sessionId: pane.sessionId,
     });
   } catch (e) { console.error("duplicate failed", e); }
 }
@@ -1331,6 +1404,7 @@ async function detachPane(paneId: string, screenX: number, screenY: number) {
       terminalId: paneId,
       title: pane.baseTitle,
       sshArgs: pane.sshArgs,
+      sessionId: pane.sessionId,
       initialContent: content,
       screenX, screenY,
       isLastTab: tab.panes.length === 1 && tabs.size === 1,

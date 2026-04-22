@@ -119,6 +119,8 @@ struct AddTabPayload {
     title: String,
     ssh_args: Vec<String>,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     adopt: bool,
     #[serde(default)]
     initial_content: String,
@@ -587,7 +589,7 @@ async fn open_ssh(id: String, new_window: bool, app: AppHandle, state: State<'_,
     let title = format!("{}:{}", folder_name, session.name);
     let ssh_args = build_ssh_args(&session);
     let terminal_id = Uuid::new_v4().to_string();
-    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, adopt: false, initial_content: String::new() };
+    let payload = AddTabPayload { terminal_id, title: title.clone(), ssh_args, session_id: Some(session.id.clone()), adopt: false, initial_content: String::new() };
 
     let existing_label = if new_window {
         None
@@ -616,8 +618,7 @@ async fn open_ssh(id: String, new_window: bool, app: AppHandle, state: State<'_,
             .title(title.clone())
             .inner_size(1100.0, 720.0)
             .min_inner_size(640.0, 400.0)
-            .resizable(true)
-            .disable_drag_drop_handler();
+            .resizable(true);
         builder.build().map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -658,6 +659,7 @@ async fn spawn_terminal(
     title: String,
     new_window: bool,
     source_label: String,
+    session_id: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -666,6 +668,7 @@ async fn spawn_terminal(
         terminal_id,
         title: title.clone(),
         ssh_args,
+        session_id,
         adopt: false,
         initial_content: String::new(),
     };
@@ -677,8 +680,7 @@ async fn spawn_terminal(
             .title(title)
             .inner_size(1100.0, 720.0)
             .min_inner_size(640.0, 400.0)
-            .resizable(true)
-            .disable_drag_drop_handler();
+            .resizable(true);
         builder.build().map_err(|e| e.to_string())?;
     } else if let Some(window) = app.get_webview_window(&source_label) {
         let _ = window.unminimize();
@@ -875,6 +877,7 @@ struct MergeTabPayload {
     terminal_id: String,
     title: String,
     ssh_args: Vec<String>,
+    session_id: Option<String>,
     initial_content: String,
     screen_x: f64,
     screen_y: f64,
@@ -886,6 +889,7 @@ async fn drop_tab(
     terminal_id: String,
     title: String,
     ssh_args: Vec<String>,
+    session_id: Option<String>,
     initial_content: String,
     screen_x: f64,
     screen_y: f64,
@@ -911,6 +915,7 @@ async fn drop_tab(
                 terminal_id,
                 title,
                 ssh_args,
+                session_id,
                 initial_content,
                 screen_x,
                 screen_y,
@@ -932,6 +937,7 @@ async fn drop_tab(
         terminal_id,
         title: title.clone(),
         ssh_args,
+        session_id,
         adopt: true,
         initial_content,
     };
@@ -941,8 +947,7 @@ async fn drop_tab(
         .inner_size(1100.0, 720.0)
         .min_inner_size(640.0, 400.0)
         .resizable(true)
-        .position(screen_x - 100.0, screen_y - 20.0)
-        .disable_drag_drop_handler();
+        .position(screen_x - 100.0, screen_y - 20.0);
     builder.build().map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -1072,6 +1077,25 @@ fn pty_kill(terminal_id: String, state: State<AppState>) -> Result<(), String> {
 
 // --- SFTP Commands ---
 
+/// Resolve the SFTP "home" (canonical of ".") for a session without keeping
+/// the connection alive. Used by the frontend to expand "~" found in window
+/// titles when tracking the remote shell's cwd. Result is cached on the JS
+/// side per session, so this command runs at most once per session lifetime.
+#[tauri::command]
+fn get_session_home(session_id: String, state: State<AppState>) -> Result<String, String> {
+    let data = load_data()?;
+    let session = data.sessions.iter().find(|s| s.id == session_id).cloned().ok_or("Session not found")?;
+    fix_key_permissions(&session.key_file)?;
+    if let Some(jump) = &session.jump_host { fix_key_permissions(&jump.key_file)?; }
+    let rt = &state.runtime;
+    rt.block_on(async {
+        let config = Arc::new(russh::client::Config::default());
+        let (sftp, _jump, _target) = connect_sftp(&session, config).await?;
+        let home = sftp.canonicalize(".").await.map_err(|e| format!("home: {}", e))?;
+        Ok::<String, String>(home)
+    })
+}
+
 #[tauri::command]
 fn sftp_connect(session_id: String, state: State<AppState>) -> Result<String, String> {
     let data = load_data()?;
@@ -1200,6 +1224,7 @@ fn main() {
             reorder_sessions, reorder_folders, open_ssh,
             sftp_connect, sftp_disconnect, sftp_list_dir,
             sftp_upload, sftp_download, sftp_mkdir, sftp_delete,
+            get_session_home,
             pty_spawn, pty_write, pty_resize, pty_kill, pty_take_pending, drop_tab,
             spawn_terminal, get_ssh_args_for_session,
             get_terminal_theme, set_terminal_theme,
