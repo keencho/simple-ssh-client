@@ -99,20 +99,46 @@ export async function openSftpPanel(sessionId: string, initialDir?: string, sess
   };
   addPanel(panel);
 
-  // Subscribe to progress events for this session.
+  // Subscribe to progress events for this session. Coalesce updates per
+  // animation frame: even if many events arrive in a single frame, the
+  // store mutates once. Once a filename hits 100%, we mark it finished
+  // and ignore subsequent events until cleanup — otherwise the SCP path
+  // (whose backend timer keeps emitting 100% until the child process
+  // actually exits) re-adds and re-removes the card every 1.5s, causing
+  // visible flicker.
   try {
+    const pending = new Map<string, { bytes: number; total: number; direction: "upload" | "download" }>();
+    const finished = new Set<string>();         // sticky, until cleanup
+    const justCompleted = new Set<string>();    // drained per flush
+    let raf: number | null = null;
+    const flush = () => {
+      raf = null;
+      for (const [filename, u] of pending) {
+        upsertTransfer(id, { filename, bytes: u.bytes, total: u.total, direction: u.direction });
+      }
+      pending.clear();
+      for (const filename of justCompleted) {
+        setTimeout(() => {
+          removeTransfer(id, filename);
+          finished.delete(filename);          // allow re-download of same name later
+        }, 1500);
+      }
+      justCompleted.clear();
+    };
     const unlisten = await listen<SftpProgress>("sftp-progress", (event) => {
       const p = event.payload;
       if (p.session_id !== sessionId) return;
-      upsertTransfer(id, {
-        filename: p.filename,
+      if (finished.has(p.filename)) return;   // ignore repeated 100% emits
+      pending.set(p.filename, {
         bytes: p.bytes_transferred,
         total: p.total_bytes,
-        direction: p.direction,
+        direction: p.direction as "upload" | "download",
       });
-      if (p.bytes_transferred >= p.total_bytes) {
-        setTimeout(() => removeTransfer(id, p.filename), 1500);
+      if (p.total_bytes > 0 && p.bytes_transferred >= p.total_bytes) {
+        finished.add(p.filename);
+        justCompleted.add(p.filename);
       }
+      if (raf === null) raf = requestAnimationFrame(flush);
     });
     unlistens.set(id, unlisten);
   } catch {}

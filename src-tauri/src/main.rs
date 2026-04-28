@@ -414,6 +414,96 @@ async fn upload_bytes_impl(sftp: &russh_sftp::client::SftpSession, remote_dir: &
     write_bytes_impl(sftp, remote_dir, filename, data, app, session_id).await
 }
 
+// SFTP transfer tuning.
+//   - 255KB per request stays under typical server packet limits and the
+//     russh-sftp default (261120) for File-level reads/writes.
+//   - Progress events throttled to 200ms; frontend coalesces per RAF.
+//   - Parallel pipeline depth 8 → 8 concurrent SSH_FXP_READ requests.
+//     RTT is amortized across all 8, so on a 50ms RTT link throughput
+//     jumps from ~5MB/s (sequential) to ~40MB/s. Over LAN/localhost the
+//     ceiling is the SSH cipher / disk speed instead.
+//   - Files smaller than ~2MB use the sequential path: pipeline setup
+//     (multiple SFTP open round-trips) costs more than it saves.
+const SFTP_CHUNK_SIZE: usize = 261_120;
+const SFTP_PROGRESS_INTERVAL_MS: u128 = 200;
+const SFTP_PIPELINE_DEPTH: usize = 8;
+const SFTP_PIPELINE_THRESHOLD: u64 = 2 * 1024 * 1024;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Progress reporting decoupled from the data path.
+///
+/// The data path (writer task) only ever does `bytes.fetch_add(...)` —
+/// a single relaxed atomic op, never blocks. A dedicated timer task
+/// reads the atomic every SFTP_PROGRESS_INTERVAL_MS and emits to the
+/// frontend. This means heavy IPC backpressure or slow event dispatch
+/// can never stall the actual transfer, and we stop allocating
+/// SftpProgress structs at chunk-rate.
+struct ProgressTracker {
+    bytes: Arc<AtomicU64>,
+    _emitter: tokio::task::JoinHandle<()>,
+    cancel: Arc<AtomicU64>, // 0 = run, 1 = stop
+    app: AppHandle,
+    session_id: String,
+    filename: String,
+    direction: &'static str,
+    total_bytes: u64,
+}
+
+impl ProgressTracker {
+    fn start(app: &AppHandle, session_id: &str, filename: String, direction: &'static str, total_bytes: u64) -> Self {
+        let bytes = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicU64::new(0));
+        let app_c = app.clone();
+        let sid = session_id.to_string();
+        let fname = filename.clone();
+        let bytes_c = bytes.clone();
+        let cancel_c = cancel.clone();
+
+        // Emit 0% immediately so the transfer card appears at once.
+        let _ = app.emit("sftp-progress", SftpProgress {
+            session_id: sid.clone(), filename: fname.clone(),
+            bytes_transferred: 0, total_bytes, direction: direction.to_string(),
+        });
+
+        let emitter = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_millis(SFTP_PROGRESS_INTERVAL_MS as u64)
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if cancel_c.load(Ordering::Relaxed) != 0 { break; }
+                let n = bytes_c.load(Ordering::Relaxed);
+                let _ = app_c.emit("sftp-progress", SftpProgress {
+                    session_id: sid.clone(), filename: fname.clone(),
+                    bytes_transferred: n, total_bytes, direction: direction.to_string(),
+                });
+            }
+        });
+
+        Self {
+            bytes, _emitter: emitter, cancel,
+            app: app.clone(), session_id: session_id.to_string(),
+            filename, direction, total_bytes,
+        }
+    }
+
+    fn counter(&self) -> Arc<AtomicU64> { self.bytes.clone() }
+
+    fn finish(self) {
+        // Stop the timer and emit a final guaranteed 100% so the UI
+        // doesn't sit at 99.x% if the last interval missed.
+        self.cancel.store(1, Ordering::Relaxed);
+        let final_bytes = self.bytes.load(Ordering::Relaxed).max(self.total_bytes);
+        let _ = self.app.emit("sftp-progress", SftpProgress {
+            session_id: self.session_id, filename: self.filename,
+            bytes_transferred: final_bytes, total_bytes: self.total_bytes,
+            direction: self.direction.to_string(),
+        });
+    }
+}
+
 async fn write_bytes_impl(sftp: &russh_sftp::client::SftpSession, remote_dir: &str, filename: &str, data: &[u8], app: &AppHandle, session_id: &str) -> Result<(), String> {
     let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), filename);
     let total_bytes = data.len() as u64;
@@ -422,18 +512,30 @@ async fn write_bytes_impl(sftp: &russh_sftp::client::SftpSession, remote_dir: &s
         .map_err(|e| format!("Create failed: {}", e))?;
 
     use tokio::io::AsyncWriteExt;
-    let chunk_size = 32768;
-    let mut transferred: u64 = 0;
-    for chunk in data.chunks(chunk_size) {
+    let tracker = ProgressTracker::start(app, session_id, filename.to_string(), "upload", total_bytes);
+    let bytes = tracker.counter();
+    for chunk in data.chunks(SFTP_CHUNK_SIZE) {
         remote_file.write_all(chunk).await.map_err(|e| e.to_string())?;
-        transferred += chunk.len() as u64;
-        let _ = app.emit("sftp-progress", SftpProgress {
-            session_id: session_id.to_string(), filename: filename.to_string(),
-            bytes_transferred: transferred, total_bytes, direction: "upload".to_string(),
-        });
+        bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
     }
     remote_file.shutdown().await.map_err(|e| e.to_string())?;
+    tracker.finish();
     Ok(())
+}
+
+// Files >= this size + key auth on every hop → use the OS scp.exe in a
+// separate process. Keeps the UI completely isolated from the transfer
+// (cipher CPU, IPC, disk writes all happen in another process). Below
+// this size the connection-setup cost outweighs the win, so we stay on
+// the in-process pipelined SFTP path.
+const SCP_THRESHOLD: u64 = 50 * 1024 * 1024;
+
+fn is_scp_eligible(session: &SshSession) -> bool {
+    if session.auth_method != "key" { return false; }
+    if let Some(j) = &session.jump_host {
+        if j.auth_method != "key" { return false; }
+    }
+    true
 }
 
 async fn download_impl(sftp: &russh_sftp::client::SftpSession, remote_path: &str, local_path: &str, app: &AppHandle, session_id: &str) -> Result<(), String> {
@@ -444,23 +546,290 @@ async fn download_impl(sftp: &russh_sftp::client::SftpSession, remote_path: &str
         .map_err(|e| format!("Stat failed: {}", e))?;
     let total_bytes = metadata.size.unwrap_or(0);
 
+    let tracker = ProgressTracker::start(app, session_id, filename.clone(), "download", total_bytes);
+    let bytes = tracker.counter();
+
+    // Try external scp for big key-auth transfers.
+    let session_meta = load_data().ok().and_then(|d| d.sessions.into_iter().find(|s| s.id == session_id));
+    if total_bytes >= SCP_THRESHOLD {
+        if let Some(s) = session_meta.as_ref() {
+            if is_scp_eligible(s) {
+                match download_via_scp(s, remote_path, local_path, total_bytes, &bytes).await {
+                    Ok(()) => { tracker.finish(); return Ok(()); }
+                    Err(e) => {
+                        eprintln!("[sftp] scp path failed ({}), falling back to in-process SFTP", e);
+                        let _ = tokio::fs::remove_file(local_path).await;
+                        bytes.store(0, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    let result = if total_bytes < SFTP_PIPELINE_THRESHOLD {
+        download_sequential(sftp, remote_path, local_path, &bytes).await
+    } else {
+        match download_pipelined(sftp, remote_path, local_path, total_bytes, &bytes).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(local_path).await;
+                eprintln!("[sftp] pipelined download failed ({}), falling back to sequential", e);
+                bytes.store(0, Ordering::Relaxed);
+                download_sequential(sftp, remote_path, local_path, &bytes).await
+            }
+        }
+    };
+
+    tracker.finish();
+    result
+}
+
+/// Subprocess scp.exe download. The OS isolates everything — cipher,
+/// disk I/O, network — in its own process. We just feed args and parse
+/// scp's stderr progress line for byte counts (line redrawn with \r).
+async fn download_via_scp(
+    session: &SshSession,
+    remote_path: &str,
+    local_path: &str,
+    total_bytes: u64,
+    bytes: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    let mut cmd = Command::new("scp");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.arg("-o").arg("PubkeyAcceptedAlgorithms=+ssh-rsa");
+    cmd.arg("-o").arg("HostKeyAlgorithms=+ssh-rsa");
+    cmd.arg("-o").arg("ServerAliveInterval=60");
+    cmd.arg("-o").arg("ServerAliveCountMax=3");
+    cmd.arg("-o").arg("TCPKeepAlive=yes");
+    // Auto-add unknown hosts (matches our terminal flow's effective UX —
+    // the user just connected via ssh.exe and trusted the key).
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    if let Some(jump) = &session.jump_host {
+        cmd.arg("-o").arg(format!(
+            "ProxyCommand=ssh -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o StrictHostKeyChecking=accept-new -i \"{}\" -W %h:%p -p {} {}@{}",
+            jump.key_file, jump.port, jump.user, jump.host
+        ));
+    }
+    cmd.arg("-i").arg(&session.key_file);
+    cmd.arg("-P").arg(session.port.to_string());
+    cmd.arg(format!("{}@{}:{}", session.user, session.host, remote_path));
+    cmd.arg(local_path);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("scp spawn failed: {}", e))?;
+    let mut stderr = child.stderr.take().ok_or("scp stderr missing".to_string())?;
+
+    // OpenSSH scp suppresses its built-in progress meter when stderr is
+    // not a TTY, so we can't parse percentages from it. Instead, poll the
+    // local file's size — that's ground truth (scp writes directly to
+    // the destination path). We still drain stderr to capture error text
+    // for the failure message, but only the last line is kept.
+    let local_path_owned = local_path.to_string();
+    let bytes_c = bytes.clone();
+    let poll_stop = Arc::new(AtomicU64::new(0));
+    let poll_stop_c = poll_stop.clone();
+    let poller = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if poll_stop_c.load(Ordering::Relaxed) != 0 { break; }
+            if let Ok(meta) = tokio::fs::metadata(&local_path_owned).await {
+                bytes_c.store(meta.len(), Ordering::Relaxed);
+            }
+        }
+    });
+
+    let err_pump = tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        let mut last_line = String::new();
+        let mut accum = String::new();
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    accum.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    while let Some(pos) = accum.find(|c: char| c == '\r' || c == '\n') {
+                        let line: String = accum.drain(..=pos).collect();
+                        let t = line.trim();
+                        if !t.is_empty() { last_line = t.to_string(); }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if !accum.trim().is_empty() { last_line = accum.trim().to_string(); }
+        last_line
+    });
+
+    let status = child.wait().await.map_err(|e| format!("scp wait: {}", e))?;
+    poll_stop.store(1, Ordering::Relaxed);
+    let _ = poller.await;
+    let last_err = err_pump.await.unwrap_or_default();
+    if !status.success() {
+        return Err(format!("scp exit {:?}: {}", status.code(), last_err));
+    }
+    bytes.store(total_bytes, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn download_sequential(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_path: &str,
+    local_path: &str,
+    bytes: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
     let mut remote_file = sftp.open(remote_path).await
         .map_err(|e| format!("Open failed: {}", e))?;
+    let bytes = bytes.clone();
 
-    use tokio::io::AsyncReadExt;
-    let mut local_file = fs::File::create(local_path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 32768];
-    let mut transferred: u64 = 0;
+    // Single dedicated blocking thread for disk writes — sync I/O via
+    // FileExt::seek_write avoids the per-chunk spawn_blocking that
+    // tokio::fs::File does on Windows. Reader pushes chunks; writer
+    // drains and write_all_at's them. tx drops when reader finishes,
+    // closing rx and ending the writer.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(SFTP_PIPELINE_DEPTH);
+    let local_path_owned = local_path.to_string();
+    let bytes_w = bytes.clone();
+    let writer = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut file = std::fs::File::create(&local_path_owned).map_err(|e| e.to_string())?;
+        while let Ok(buf) = rx.recv() {
+            std::io::Write::write_all(&mut file, &buf).map_err(|e| e.to_string())?;
+            bytes_w.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        }
+        std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+
+    let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
     loop {
         let n = remote_file.read(&mut buf).await.map_err(|e| e.to_string())?;
         if n == 0 { break; }
-        std::io::Write::write_all(&mut local_file, &buf[..n]).map_err(|e| e.to_string())?;
-        transferred += n as u64;
-        let _ = app.emit("sftp-progress", SftpProgress {
-            session_id: session_id.to_string(), filename: filename.clone(),
-            bytes_transferred: transferred, total_bytes, direction: "download".to_string(),
-        });
+        if tx.send(buf[..n].to_vec()).is_err() { break; }
     }
+    drop(tx);
+    writer.await.map_err(|e| format!("writer join: {}", e))??;
+    Ok(())
+}
+
+/// Pipelined download: open N file handles to the same path, each handle
+/// reads a round-robin slice of the file. SFTP multiplexes the read
+/// requests on one channel, so we get N concurrent SSH_FXP_READ in flight
+/// without ordering hassles. A dedicated blocking writer thread drains
+/// chunks via `seek_write` (Windows) / `write_all_at` (Unix), so we
+/// never pay tokio's per-write spawn_blocking overhead and writes never
+/// stall reads. Progress is updated via Arc<AtomicU64>; a separate timer
+/// task emits to the frontend independently.
+async fn download_pipelined(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_path: &str,
+    local_path: &str,
+    total_bytes: u64,
+    bytes: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let total_chunks = total_bytes.div_ceil(SFTP_CHUNK_SIZE as u64);
+    let workers = std::cmp::min(SFTP_PIPELINE_DEPTH as u64, total_chunks) as usize;
+
+    let mut files = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let f = sftp.open(remote_path).await
+            .map_err(|e| format!("Pipeline open failed: {}", e))?;
+        files.push(f);
+    }
+
+    // Pre-allocate so writer can seek+write at any offset (sparse fine
+    // on NTFS/ext4 but set_len ensures the OS reserves the size).
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true)
+            .open(local_path).map_err(|e| e.to_string())?;
+        f.set_len(total_bytes).map_err(|e| e.to_string())?;
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(workers * 2);
+
+    // Single blocking writer thread.
+    let local_path_owned = local_path.to_string();
+    let bytes_w = bytes.clone();
+    let writer = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let file = std::fs::OpenOptions::new()
+            .write(true).open(&local_path_owned).map_err(|e| e.to_string())?;
+        while let Ok((offset, data)) = rx.recv() {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                let mut written = 0;
+                while written < data.len() {
+                    let n = file.seek_write(&data[written..], offset + written as u64)
+                        .map_err(|e| e.to_string())?;
+                    if n == 0 { return Err("write returned 0".into()); }
+                    written += n;
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                file.write_all_at(&data, offset).map_err(|e| e.to_string())?;
+            }
+            bytes_w.fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        file.sync_data().map_err(|e| e.to_string())?;
+        Ok(())
+    });
+
+    let stride = (workers as u64) * (SFTP_CHUNK_SIZE as u64);
+    let mut reader_tasks = Vec::with_capacity(workers);
+    for (worker_id, mut file) in files.into_iter().enumerate() {
+        let tx = tx.clone();
+        let task = tokio::spawn(async move {
+            let mut offset = (worker_id as u64) * (SFTP_CHUNK_SIZE as u64);
+            if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+                return Err(format!("worker {} seek failed", worker_id));
+            }
+            let mut last_pos = offset;
+            while offset < total_bytes {
+                let want = std::cmp::min(SFTP_CHUNK_SIZE as u64, total_bytes - offset) as usize;
+                if last_pos != offset {
+                    file.seek(std::io::SeekFrom::Start(offset)).await
+                        .map_err(|e| format!("worker {} seek: {}", worker_id, e))?;
+                }
+                let mut buf = vec![0u8; want];
+                let mut filled = 0;
+                while filled < want {
+                    let n = file.read(&mut buf[filled..]).await
+                        .map_err(|e| format!("worker {} read: {}", worker_id, e))?;
+                    if n == 0 { break; }
+                    filled += n;
+                }
+                if filled == 0 { break; }
+                buf.truncate(filled);
+                last_pos = offset + filled as u64;
+                if tx.send((offset, buf)).is_err() { return Ok(()); }
+                offset += stride;
+            }
+            Ok::<(), String>(())
+        });
+        reader_tasks.push(task);
+    }
+    drop(tx);
+
+    for t in reader_tasks {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(format!("worker join: {}", e)),
+        }
+    }
+    writer.await.map_err(|e| format!("writer join: {}", e))??;
     Ok(())
 }
 
@@ -1663,33 +2032,46 @@ fn sftp_list_dir(session_id: String, path: String, state: State<AppState>) -> Re
 }
 
 #[tauri::command]
-fn sftp_upload(session_id: String, remote_dir: String, local_path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let connections = state.sftp_connections.lock().unwrap();
-    let handle = connections.get(&session_id).ok_or("Not connected")?;
+async fn sftp_upload(session_id: String, remote_dir: String, local_path: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let tx = {
+        let connections = state.sftp_connections.lock().unwrap();
+        let handle = connections.get(&session_id).ok_or("Not connected")?;
+        handle.tx.clone()
+    };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    state.runtime.block_on(handle.tx.send(SftpCommand::Upload { local_path, remote_dir, app, session_id: session_id.clone(), reply: reply_tx }))
+    tx.send(SftpCommand::Upload { local_path, remote_dir, app, session_id: session_id.clone(), reply: reply_tx }).await
         .map_err(|_| "Worker disconnected".to_string())?;
-    state.runtime.block_on(reply_rx).map_err(|_| "Worker crashed".to_string())?
+    reply_rx.await.map_err(|_| "Worker crashed".to_string())?
 }
 
 #[tauri::command]
-fn sftp_upload_bytes(session_id: String, remote_dir: String, filename: String, data: Vec<u8>, app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let connections = state.sftp_connections.lock().unwrap();
-    let handle = connections.get(&session_id).ok_or("Not connected")?;
+async fn sftp_upload_bytes(session_id: String, remote_dir: String, filename: String, data: Vec<u8>, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let tx = {
+        let connections = state.sftp_connections.lock().unwrap();
+        let handle = connections.get(&session_id).ok_or("Not connected")?;
+        handle.tx.clone()
+    };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    state.runtime.block_on(handle.tx.send(SftpCommand::UploadBytes { remote_dir, filename, data, app, session_id: session_id.clone(), reply: reply_tx }))
+    tx.send(SftpCommand::UploadBytes { remote_dir, filename, data, app, session_id: session_id.clone(), reply: reply_tx }).await
         .map_err(|_| "Worker disconnected".to_string())?;
-    state.runtime.block_on(reply_rx).map_err(|_| "Worker crashed".to_string())?
+    reply_rx.await.map_err(|_| "Worker crashed".to_string())?
 }
 
+/// Async — downloads can take minutes. A sync command would run on the
+/// Tauri main thread and block_on(reply_rx) freezes the window. async
+/// fn lets Tauri schedule the await on its async pool, keeping the
+/// main message pump free.
 #[tauri::command]
-fn sftp_download(session_id: String, remote_path: String, local_path: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let connections = state.sftp_connections.lock().unwrap();
-    let handle = connections.get(&session_id).ok_or("Not connected")?;
+async fn sftp_download(session_id: String, remote_path: String, local_path: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let tx = {
+        let connections = state.sftp_connections.lock().unwrap();
+        let handle = connections.get(&session_id).ok_or("Not connected")?;
+        handle.tx.clone()
+    };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    state.runtime.block_on(handle.tx.send(SftpCommand::Download { remote_path, local_path, app, session_id: session_id.clone(), reply: reply_tx }))
+    tx.send(SftpCommand::Download { remote_path, local_path, app, session_id: session_id.clone(), reply: reply_tx }).await
         .map_err(|_| "Worker disconnected".to_string())?;
-    state.runtime.block_on(reply_rx).map_err(|_| "Worker crashed".to_string())?
+    reply_rx.await.map_err(|_| "Worker crashed".to_string())?
 }
 
 #[tauri::command]
