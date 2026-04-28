@@ -217,16 +217,20 @@ export async function downloadSelected(id: string): Promise<void> {
   const localDir = await open({ directory: true, title: t("sftp.dialog.saveTo") });
   if (!localDir) return;
   const items = p.entries.filter(e => p.selected.has(e.path) && !e.is_dir);
-  for (const e of items) {
+  clearPanelSelection(id);
+  // Kick off all downloads concurrently — backend now spawns each
+  // transfer in its own task so they don't serialize behind the SFTP
+  // worker queue. SCP-eligible files run in separate processes;
+  // SFTP-path files multiplex over the same SSH channel.
+  await Promise.all(items.map(async (e) => {
     const localPath = (localDir as string).replace(/[/\\]$/, "") + "/" + e.name;
     try {
       await Sftp.sftpDownload(p.sessionId, e.path, localPath);
     } catch (err) {
       await mountAlert(t("sftp.errors.downloadName", { name: e.name, error: String(err) }));
     }
-  }
-  clearPanelSelection(id);
-  await refreshDir(id);
+  }));
+  // No refreshDir: download doesn't change remote state.
 }
 
 export async function downloadOne(id: string, remotePath: string, name: string): Promise<void> {

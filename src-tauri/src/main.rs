@@ -479,6 +479,13 @@ impl ProgressTracker {
                     session_id: sid.clone(), filename: fname.clone(),
                     bytes_transferred: n, total_bytes, direction: direction.to_string(),
                 });
+                // Self-terminate the moment we've emitted 100%. Otherwise
+                // the SCP path keeps the file size at total_bytes for a
+                // while (fsync, channel close, child exit), and we'd keep
+                // re-emitting 100% every interval. The frontend cleans
+                // its sticky-finished mark after 1.5s; if a fresh 100%
+                // arrives after that, the card flickers.
+                if total_bytes > 0 && n >= total_bytes { break; }
             }
         });
 
@@ -1990,12 +1997,31 @@ fn sftp_connect(session_id: String, state: State<AppState>) -> Result<String, St
             // Keep handles alive
             let _j = _jump;
             let _t = _target;
+            // Wrap in Arc so transfer commands can take owned references
+            // and run concurrently in spawned tasks (multi-file downloads
+            // / uploads no longer block each other or the worker).
+            let sftp = Arc::new(sftp);
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     SftpCommand::ListDir { path, reply } => { let _ = reply.send(list_dir_impl(&sftp, &path).await); }
-                    SftpCommand::Upload { local_path, remote_dir, app, session_id, reply } => { let _ = reply.send(upload_impl(&sftp, &local_path, &remote_dir, &app, &session_id).await); }
-                    SftpCommand::UploadBytes { remote_dir, filename, data, app, session_id, reply } => { let _ = reply.send(upload_bytes_impl(&sftp, &remote_dir, &filename, &data, &app, &session_id).await); }
-                    SftpCommand::Download { remote_path, local_path, app, session_id, reply } => { let _ = reply.send(download_impl(&sftp, &remote_path, &local_path, &app, &session_id).await); }
+                    SftpCommand::Upload { local_path, remote_dir, app, session_id, reply } => {
+                        let s = sftp.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(upload_impl(&s, &local_path, &remote_dir, &app, &session_id).await);
+                        });
+                    }
+                    SftpCommand::UploadBytes { remote_dir, filename, data, app, session_id, reply } => {
+                        let s = sftp.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(upload_bytes_impl(&s, &remote_dir, &filename, &data, &app, &session_id).await);
+                        });
+                    }
+                    SftpCommand::Download { remote_path, local_path, app, session_id, reply } => {
+                        let s = sftp.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(download_impl(&s, &remote_path, &local_path, &app, &session_id).await);
+                        });
+                    }
                     SftpCommand::Mkdir { path, reply } => { let _ = reply.send(sftp.create_dir(&path).await.map_err(|e| format!("Failed: {}", e))); }
                     SftpCommand::Delete { path, is_dir, reply } => {
                         let r = if is_dir { sftp.remove_dir(&path).await } else { sftp.remove_file(&path).await };
