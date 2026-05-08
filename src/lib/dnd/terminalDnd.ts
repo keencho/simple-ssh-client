@@ -345,11 +345,19 @@ export function paneDnd(node: HTMLElement) {
 // Global cleanup — capture-phase, runs even if drag source vanished
 // ============================================================
 export function installGlobalDragCleanup(tabsEl: HTMLElement) {
+  // CSS artifact cleanup runs in capture phase (safe, idempotent). But
+  // resetting the shared dragSrcTabId / dragSrcPane MUST be deferred —
+  // doing it in capture phase would null the state before the bubble-
+  // phase dragend handler in tabDnd / paneDnd runs, so the "drop
+  // outside any window" path never fires (dropTabOut → detach/merge
+  // never gets called). Use setTimeout 0 so the per-action handler
+  // sees the live state, then we wipe.
   const onDragEnd = () => {
     clearAllDragArtifacts(tabsEl);
-    // Reset shared state so the next drag isn't poisoned by a lost dragend.
-    dragSrcTabId = null;
-    dragSrcPane = null;
+    setTimeout(() => {
+      dragSrcTabId = null;
+      dragSrcPane = null;
+    }, 0);
   };
   const onDrop = () => setTimeout(() => {
     clearAllDragArtifacts(tabsEl);

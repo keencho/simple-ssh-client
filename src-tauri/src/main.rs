@@ -1639,20 +1639,24 @@ async fn drop_tab(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    // Try to find a target window whose outer rect contains the cursor.
-    // Both "main" (sidebar+terminal) and "term-*" (terminal-only) windows
-    // are valid merge targets.
+    let cur_pos = app.cursor_position().ok();
+    let src_scale = app.get_webview_window(&source_label)
+        .and_then(|w| w.scale_factor().ok())
+        .unwrap_or(1.0);
+    let (cur_x, cur_y) = match cur_pos {
+        Some(p) => (p.x, p.y),
+        None => (screen_x * src_scale, screen_y * src_scale),
+    };
     for (label, window) in app.webview_windows() {
         if label != "main" && !label.starts_with("term-") { continue; }
         if label == source_label { continue; }
         let Ok(pos) = window.outer_position() else { continue };
         let Ok(size) = window.outer_size() else { continue };
-        let Ok(scale) = window.scale_factor() else { continue };
-        let x0 = pos.x as f64 / scale;
-        let y0 = pos.y as f64 / scale;
-        let x1 = x0 + size.width as f64 / scale;
-        let y1 = y0 + size.height as f64 / scale;
-        if screen_x >= x0 && screen_x < x1 && screen_y >= y0 && screen_y < y1 {
+        let x0 = pos.x as f64;
+        let y0 = pos.y as f64;
+        let x1 = x0 + size.width as f64;
+        let y1 = y0 + size.height as f64;
+        if cur_x >= x0 && cur_x < x1 && cur_y >= y0 && cur_y < y1 {
             let merge = MergeTabPayload {
                 terminal_id,
                 title,
