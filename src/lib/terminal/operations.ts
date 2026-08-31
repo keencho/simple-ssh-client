@@ -2,6 +2,7 @@ import { tick } from "svelte";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getTheme, applyUiTheme, getFontValue, type TerminalTheme } from "../../themes";
 import { t } from "../i18n";
+import { showToast } from "../stores/toast.svelte";
 import * as Ssh from "../api/ssh";
 import * as Data from "../api/data";
 import type { AddTabPayload } from "../api/types";
@@ -34,6 +35,7 @@ import {
   uid,
   setCurrentTheme,
   setCurrentFontFamily,
+  getCurrentFontFamily,
   FONT_DEFAULT,
   FONT_MIN,
   FONT_MAX,
@@ -89,11 +91,13 @@ export function applyThemeToAllPanes(theme: TerminalTheme): void {
 
 export function applyFontToAllPanes(fontFamily: string): void {
   setCurrentFontFamily(fontFamily);
+  // 스토어를 거쳐서 다시 읽는다 — 한글 폴백이 붙은 최종 스택이 필요하다.
+  const resolved = getCurrentFontFamily();
   for (const tab of terminalStore.tabs) {
     for (const p of tab.panes) {
       const x = getXterm(p.id);
       if (!x) continue;
-      x.term.options.fontFamily = fontFamily;
+      x.term.options.fontFamily = resolved;
       try { x.fit.fit(); } catch {}
       sendResize(p.id);
     }
@@ -440,11 +444,48 @@ export function resetDividerToCenter(tabId: string, leftIdx: number): void {
 }
 
 // ---------- Clipboard ----------
+// 선택 즉시 복사. config.json에 저장되고 창마다 따로 들고 있으므로
+// 분리된 터미널 창은 copy-on-select-changed 이벤트로 갱신된다.
+let _copyOnSelect = false;
+export function setCopyOnSelectFlag(on: boolean): void { _copyOnSelect = on; }
+
 export function hasSelectionInActivePane(): boolean {
   const ap = getActivePane();
   if (!ap) return false;
   const x = getXterm(ap.pane.id);
   return !!x && x.term.hasSelection();
+}
+
+// 한글/이모지는 UTF-16 code unit 수와 눈에 보이는 글자 수가 다르다.
+// 토스트에 띄우는 숫자는 사람이 세는 쪽에 맞춘다.
+function describeCopied(text: string): string {
+  const chars = Array.from(text).length;
+  const lines = text.split("\n").length;
+  return lines > 1
+    ? t("terminal.toast.copiedLines", { lines, chars })
+    : t("terminal.toast.copied", { chars });
+}
+
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(describeCopied(text));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 드래그/더블클릭으로 만들어진 선택을 바로 복사한다.
+// 활성 페인이 아니라 실제로 선택이 일어난 페인을 대상으로 한다 —
+// mouseup 시점엔 포커스 전환이 아직 안 끝났을 수 있다.
+export async function copySelectionFromPane(paneId: string): Promise<void> {
+  if (!_copyOnSelect) return;
+  const x = getXterm(paneId);
+  if (!x || !x.term.hasSelection()) return;
+  const sel = x.term.getSelection();
+  if (!sel) return;
+  await writeClipboard(sel);
 }
 
 export async function copyActiveSelection(): Promise<boolean> {
@@ -454,12 +495,7 @@ export async function copyActiveSelection(): Promise<boolean> {
   if (!x) return false;
   const sel = x.term.getSelection();
   if (!sel) return false;
-  try {
-    await navigator.clipboard.writeText(sel);
-    return true;
-  } catch {
-    return false;
-  }
+  return writeClipboard(sel);
 }
 
 export async function pasteToActive(): Promise<void> {
@@ -716,6 +752,15 @@ function removeAdoptedPaneAfterAdoption(tabId: string, paneId: string, indexHint
 }
 
 // ---------- Keyboard shortcuts ----------
+// Ctrl 단독 + C는 선택 영역이 있을 때만 복사로 가로챈다. copy-on-select이
+// 켜져 있으면 선택하는 순간 이미 복사됐으므로 가로챌 이유가 없다 —
+// 그대로 흘려보내 SIGINT가 되게 한다(Ctrl+Shift+C는 언제나 복사).
+function ctrlCCopies(e: KeyboardEvent): boolean {
+  if (!e.ctrlKey || e.shiftKey || e.altKey || e.code !== "KeyC") return false;
+  if (_copyOnSelect) return false;
+  return hasSelectionInActivePane();
+}
+
 export function isOurShortcut(e: KeyboardEvent): boolean {
   if (e.ctrlKey && e.shiftKey && e.code === "Digit5") return true;
   if (e.ctrlKey && e.shiftKey && e.code === "KeyW") return true;
@@ -723,7 +768,7 @@ export function isOurShortcut(e: KeyboardEvent): boolean {
   if (e.ctrlKey && e.shiftKey && e.code === "KeyC") return true;
   if (e.ctrlKey && e.shiftKey && e.code === "KeyV") return true;
   if (e.ctrlKey && e.shiftKey && e.key === "Enter") return true;
-  if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyC" && hasSelectionInActivePane()) return true;
+  if (ctrlCCopies(e)) return true;
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyV") return true;
   if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) return true;
   return false;
@@ -762,7 +807,7 @@ export function handleShortcut(e: KeyboardEvent): boolean {
     void pasteToActive();
     return true;
   }
-  if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyC" && hasSelectionInActivePane()) {
+  if (ctrlCCopies(e)) {
     e.preventDefault();
     void copyActiveSelection().then((ok) => {
       if (!ok) return;

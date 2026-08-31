@@ -11,7 +11,8 @@
       "theme": "Theme",
       "layout": "Appearance",
       "log": "Logs",
-      "data": "Data"
+      "data": "Data",
+      "terminal": "Terminal"
     },
     "font": {
       "title": "Font",
@@ -111,6 +112,12 @@
         "export": "Export failed: {error}",
         "import": "Import failed: {error}"
       }
+    },
+    "terminal": {
+      "title": "Terminal",
+      "subtitle": "Mouse and clipboard behaviour. Applies to every terminal window immediately.",
+      "copyOnSelectToggle": "<strong>Copy on select</strong> — text selected by dragging or double-clicking is copied to the clipboard right away.",
+      "copyOnSelectHint": "When on, Ctrl+C is no longer intercepted for copying and always sends SIGINT. Ctrl+Shift+C still copies."
     }
   },
   "modal": {
@@ -357,6 +364,10 @@
       "search": "Search...",
       "uncategorized": "Uncategorized",
       "empty": "No results"
+    },
+    "toast": {
+      "copied": "Copied {chars} characters",
+      "copiedLines": "Copied {lines} lines · {chars} characters"
     }
   }
 }

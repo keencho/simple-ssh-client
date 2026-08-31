@@ -18,7 +18,7 @@
   import { mountConfirm } from "./mount";
 
   type SidebarPosition = "left" | "right";
-  type Section = "font" | "theme" | "layout" | "log" | "data";
+  type Section = "font" | "theme" | "terminal" | "layout" | "log" | "data";
 
   let {
     initialSection,
@@ -46,6 +46,7 @@
   let currentFontName = $state<string>(DEFAULT_FONT);
   let currentLogDir = $state<string>("");
   let currentSshVerbose = $state<boolean>(false);
+  let currentCopyOnSelect = $state<boolean>(false);
   let currentDataPath = $state<string>("");
   let lang = $state<Lang>(getLanguage());
   // svelte-ignore state_referenced_locally
@@ -54,13 +55,14 @@
 
   onMount(() => {
     void (async () => {
-      [currentThemeName, currentFontName, currentLogDir, currentSshVerbose, currentDataPath] =
+      [currentThemeName, currentFontName, currentLogDir, currentSshVerbose, currentDataPath, currentCopyOnSelect] =
         await Promise.all([
           Config.getTerminalTheme().then((v) => v ?? DEFAULT_THEME),
           Config.getTerminalFont().then((v) => v ?? DEFAULT_FONT),
           Config.getLogDir(),
           Config.getSshVerbose(),
           Config.getDataFilePath(),
+          Config.getCopyOnSelect(),
         ]);
       loaded = true;
       void updateFontUI(currentFontName);
@@ -223,6 +225,12 @@
     catch (err) { void onAlert($_("settings.log.errors.verbose", { values: { error: String(err) } })); }
   }
 
+  // --- Terminal ---
+  async function onCopyOnSelectChange() {
+    try { await Config.setCopyOnSelect(currentCopyOnSelect); }
+    catch (err) { void onAlert(String(err)); }
+  }
+
   // --- Data ---
   const parentOf = (p: string) => p.replace(/[\\/][^\\/]+$/, "") || p;
 
@@ -277,6 +285,7 @@
       <aside class="settings-nav">
         <button class="settings-nav-item" class:active={section === "font"} onclick={() => (section = "font")}>{$_("settings.nav.font")}</button>
         <button class="settings-nav-item" class:active={section === "theme"} onclick={() => (section = "theme")}>{$_("settings.nav.theme")}</button>
+        <button class="settings-nav-item" class:active={section === "terminal"} onclick={() => (section = "terminal")}>{$_("settings.nav.terminal")}</button>
         <button class="settings-nav-item" class:active={section === "layout"} onclick={() => (section = "layout")}>{$_("settings.nav.layout")}</button>
         <button class="settings-nav-item" class:active={section === "log"} onclick={() => (section = "log")}>{$_("settings.nav.log")}</button>
         <button class="settings-nav-item" class:active={section === "data"} onclick={() => (section = "data")}>{$_("settings.nav.data")}</button>
@@ -398,6 +407,19 @@ The quick brown fox jumps over 0123456789 (&lbrace;[]&rbrace;) "`~$"</pre>
               <span>{$_("settings.layout.language.ko")}</span>
             </label>
           </div>
+        </section>
+
+        <!-- Terminal -->
+        <section class="settings-panel" hidden={section !== "terminal"}>
+          <div class="settings-panel-title">{$_("settings.terminal.title")}</div>
+          <div class="settings-panel-subtitle">{$_("settings.terminal.subtitle")}</div>
+
+          <label class="settings-toggle-row">
+            <input type="checkbox" bind:checked={currentCopyOnSelect} onchange={onCopyOnSelectChange} />
+            <span class="toggle-mini-track"><span class="toggle-mini-thumb"></span></span>
+            <span class="settings-toggle-text">{@html $_("settings.terminal.copyOnSelectToggle")}</span>
+          </label>
+          <div class="settings-panel-hint">{$_("settings.terminal.copyOnSelectHint")}</div>
         </section>
 
         <!-- Log -->

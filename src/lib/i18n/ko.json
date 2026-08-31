@@ -11,7 +11,8 @@
       "theme": "테마",
       "layout": "외관",
       "log": "로그",
-      "data": "데이터"
+      "data": "데이터",
+      "terminal": "터미널"
     },
     "font": {
       "title": "폰트",
@@ -111,6 +112,12 @@
         "export": "내보내기 실패: {error}",
         "import": "가져오기 실패: {error}"
       }
+    },
+    "terminal": {
+      "title": "터미널",
+      "subtitle": "마우스와 클립보드 동작을 조정합니다. 모든 터미널 창에 즉시 적용됩니다.",
+      "copyOnSelectToggle": "<strong>선택하면 바로 복사</strong> — 드래그나 더블클릭으로 선택한 텍스트를 클립보드에 즉시 복사합니다.",
+      "copyOnSelectHint": "켜면 Ctrl+C는 복사를 가로채지 않고 항상 SIGINT로 전달됩니다. 복사는 Ctrl+Shift+C로도 가능합니다."
     }
   },
   "modal": {
@@ -357,6 +364,10 @@
       "search": "검색...",
       "uncategorized": "미분류",
       "empty": "결과 없음"
+    },
+    "toast": {
+      "copied": "{chars}자 복사됨",
+      "copiedLines": "{lines}줄 · {chars}자 복사됨"
     }
   }
 }

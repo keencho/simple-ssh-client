@@ -592,3 +592,24 @@ export function getFontValue(label: string | null | undefined): string {
   const target = label ?? DEFAULT_FONT;
   return FONTS.find((f) => f.label === target)?.value ?? FONTS[0].value;
 }
+
+// 한글 고정폭 폴백. 위 FONTS의 Latin 폰트들에는 한글 글리프가 없어서 그냥 두면
+// 시스템 맑은 고딕으로 떨어지는데, 맑은 고딕은 고정폭이 아니라서 한글 폭이
+// xterm 셀 격자의 정확히 2배가 아니다(= 한글 줄이 격자에서 어긋난다).
+// 나눔고딕코딩은 번들되어 있고 한글 = Latin 2배로 설계돼 격자에 맞는다.
+export const KOREAN_FALLBACK_FONT = '"Nanum Gothic Coding"';
+
+const GENERIC_FAMILY = /^(ui-)?(monospace|sans-serif|serif)$|^system-ui$|^SFMono-Regular$/;
+
+// 스택의 첫 generic family 바로 앞에 한글 폴백을 끼워 넣는다.
+// generic보다 뒤에 두면 브라우저가 generic에서 이미 글리프를 찾아버려 무시된다.
+// 터미널에 실제로 먹이는 값에만 적용한다 — FONTS의 원본 value는 설정 화면의
+// "설치됨/미설치" 판정(resolveActualFont)에 쓰이므로 건드리지 않는다.
+export function withKoreanFallback(stack: string): string {
+  if (stack.includes(KOREAN_FALLBACK_FONT)) return stack;
+  const parts = stack.split(",").map((s) => s.trim());
+  const at = parts.findIndex((p) => GENERIC_FAMILY.test(p.replace(/^["']|["']$/g, "")));
+  if (at < 0) parts.push(KOREAN_FALLBACK_FONT);
+  else parts.splice(at, 0, KOREAN_FALLBACK_FONT);
+  return parts.join(", ");
+}

@@ -5,6 +5,9 @@
   import { FitAddon } from "@xterm/addon-fit";
   import { WebLinksAddon } from "@xterm/addon-web-links";
   import { SerializeAddon } from "@xterm/addon-serialize";
+  import { WebglAddon } from "@xterm/addon-webgl";
+  import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
+  import { open as openExternal } from "@tauri-apps/plugin-shell";
   import {
     type PaneData,
     type TabData,
@@ -37,6 +40,7 @@
     splitActiveSameSession,
     openSessionPicker,
     copyActiveSelection,
+    copySelectionFromPane,
     pasteToActive,
   } from "../../terminal/operations";
   import { t } from "../../i18n";
@@ -62,6 +66,18 @@
     return `${tab.ratios[idx] ?? 1} 1 0`;
   });
 
+  // 터미널 안의 링크는 반드시 OS에 넘긴다. WebLinksAddon의 기본 동작은
+  // window.open()이라 웹뷰가 그 URL로 통째로 이동해버릴 수 있다.
+  const SAFE_LINK_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+
+  function openLink(uri: string) {
+    let scheme: string;
+    try { scheme = new URL(uri).protocol; }
+    catch { return; }
+    if (!SAFE_LINK_SCHEMES.has(scheme)) return;
+    void openExternal(uri).catch(() => {});
+  }
+
   function triggerHomeFetch(sessionId: string | null | undefined) {
     if (!sessionId) return;
     if (getSessionHome(sessionId) || isSessionHomeInflight(sessionId)) return;
@@ -80,23 +96,66 @@
       lineHeight: 1.08,
       cursorBlink: true,
       cursorStyle: "block",
-      scrollback: 10000,
+      scrollback: 50000,
       allowProposedApi: true,
       minimumContrastRatio: 4.5,
     });
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
+      // IME 조합 중에는 무조건 xterm에 넘긴다.
+      // xterm의 _keyDown은 이 핸들러를 _compositionHelper.keydown()보다 *먼저*
+      // 부른다. 여기서 false를 반환하면 CompositionHelper가 통째로 스킵되는데,
+      //  - _finalizeComposition(false)로 취소돼야 할 지연 전송이 살아남아 → 글자 중복
+      //  - keyCode 229 경로(_handleAnyTextareaChanges)가 안 돌아 → 글자 누락
+      // 둘 다 발생한다. 조합 중 키는 전부 xterm이 처리해야 한다.
+      if (ev.isComposing || ev.keyCode === 229) return true;
       return !isOurShortcut(ev);
     });
 
     fit = new FitAddon();
     const serialize = new SerializeAddon();
     term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
+    term.loadAddon(new WebLinksAddon((_ev, uri) => openLink(uri)));
     term.loadAddon(serialize);
+    // 한글/이모지/조합 문자의 셀 폭을 최신 유니코드 규칙으로 계산한다.
+    // 이게 없으면 박스 드로잉과 한글이 섞인 줄에서 폭이 1칸씩 어긋난다.
+    term.loadAddon(new UnicodeGraphemesAddon());
+    term.unicode.activeVersion = "15-graphemes";
     term.open(xtermEl);
 
+    // WebGL 렌더러는 반드시 open() 이후에 붙인다.
+    // 기본 DOM 렌더러는 선택 영역을 마우스 이동마다 span으로 다시 만들기 때문에
+    // 드래그 선택과 스크롤이 눈에 띄게 밀린다. WebGL은 텍스처 아틀라스 + GPU라
+    // 그 비용이 사라지고, 한글처럼 폭이 다른 글리프도 셀 격자에 맞춰 그린다.
+    try {
+      const w = new WebglAddon();
+      // 컨텍스트 손실(GPU 리셋, 드라이버 갱신 등)은 정상적으로 일어날 수 있다.
+      // 이때 addon을 붙들고 있으면 화면이 죽으므로 버린다 — dispose하면
+      // xterm이 알아서 DOM 렌더러로 돌아간다.
+      w.onContextLoss(() => w.dispose());
+      term.loadAddon(w);
+    } catch {
+      // WebGL을 못 쓰는 환경(원격 데스크톱, 소프트웨어 렌더링 등)에서는
+      // 조용히 DOM 렌더러로 둔다. 느릴 뿐 동작에는 문제가 없다.
+    }
+
     registerXterm(pane.id, { term, fit, serialize });
+
+    // ---- 선택 즉시 복사 ----
+    // onSelectionChange는 드래그 중 매 프레임 터지므로 쓰지 않는다.
+    // 이 페인에서 시작한 드래그의 mouseup만 본다 — 드래그는 페인 밖에서
+    // 끝날 수 있으므로 up은 document에서 받는다.
+    let selectingHere = false;
+    const onXtermMousedown = (e: MouseEvent) => {
+      if (e.button === 0) selectingHere = true;
+    };
+    const onDocMouseup = () => {
+      if (!selectingHere) return;
+      selectingHere = false;
+      void copySelectionFromPane(pane.id);
+    };
+    xtermEl.addEventListener("mousedown", onXtermMousedown);
+    document.addEventListener("mouseup", onDocMouseup);
 
     // Replay scrollback rescued from a cross-tab move (if any), then drain
     // any output that arrived during the unmount/remount window.
@@ -158,7 +217,10 @@
 
     return () => {
       ro.disconnect();
+      xtermEl.removeEventListener("mousedown", onXtermMousedown);
+      document.removeEventListener("mouseup", onDocMouseup);
       unregisterXterm(pane.id);
+      // WebGL addon은 term.dispose()가 같이 정리한다.
       try { term.dispose(); } catch {}
     };
   });

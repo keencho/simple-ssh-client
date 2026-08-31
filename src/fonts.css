@@ -15,3 +15,38 @@
 @import "@fontsource/cascadia-code/latin-700.css";
 @import "@fontsource/source-code-pro/latin-400.css";
 @import "@fontsource/source-code-pro/latin-700.css";
+
+/*
+ * 한글 고정폭 — 나눔고딕코딩 (OFL).
+ *
+ * 위 Latin 폰트들에는 한글 글리프가 아예 없어서 예전에는 시스템 맑은 고딕으로
+ * 폴백했다. 맑은 고딕은 고정폭이 아니라 한글의 advance width가 xterm 셀 격자의
+ * 정확히 2배가 아니고, 그래서 한글이 섞인 줄에서 글자가 격자에서 미세하게
+ * 어긋났다. 나눔고딕코딩은 한글 = Latin 2배로 설계된 고정폭 코딩 폰트라 맞는다.
+ *
+ * @fontsource의 korean-400.css를 그대로 import하지 않고 여기서 직접
+ * @font-face를 쓰는 이유는 unicode-range 때문이다. fontsource의 subset CSS에는
+ * unicode-range가 없는데, 이 "korean" subset 파일에는 Latin 글리프도 들어 있다.
+ * 그대로 두면 스택 앞쪽에 놓였을 때 영문까지 나눔고딕코딩으로 그려진다.
+ * 범위를 한글로 못박아 두면 스택 어디에 끼워 넣어도 영문은 사용자가 고른
+ * 폰트가 그리고, 한글이 실제로 나오기 전까지는 500KB 파일을 받지도 않는다.
+ *
+ * 스택에 끼워 넣는 일은 themes.ts의 withKoreanFallback()이 한다.
+ */
+@font-face {
+  font-family: "Nanum Gothic Coding";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("@fontsource/nanum-gothic-coding/files/nanum-gothic-coding-korean-400-normal.woff2") format("woff2");
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7A3, U+D7B0-D7FF;
+}
+
+@font-face {
+  font-family: "Nanum Gothic Coding";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("@fontsource/nanum-gothic-coding/files/nanum-gothic-coding-korean-700-normal.woff2") format("woff2");
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7A3, U+D7B0-D7FF;
+}

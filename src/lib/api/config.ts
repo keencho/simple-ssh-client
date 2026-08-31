@@ -33,6 +33,14 @@ export const getSshVerbose = (): Promise<boolean> =>
 export const setSshVerbose = (enabled: boolean): Promise<void> =>
   invoke("set_ssh_verbose", { enabled });
 
+// Copy-on-select
+
+export const getCopyOnSelect = (): Promise<boolean> =>
+  invoke("get_copy_on_select");
+
+export const setCopyOnSelect = (enabled: boolean): Promise<void> =>
+  invoke("set_copy_on_select", { enabled });
+
 // Data file path
 
 export const getDataFilePath = (): Promise<string> =>

@@ -149,7 +149,7 @@ async function editFolder(id: string) {
 
 // --- Modal ---
 
-type SettingsSection = "font" | "theme" | "layout" | "log" | "data";
+type SettingsSection = "font" | "theme" | "terminal" | "layout" | "log" | "data";
 
 function openSettings(initialSection: SettingsSection = "font") {
   mountSettings({

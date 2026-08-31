@@ -1,7 +1,7 @@
 import type { Terminal } from "@xterm/xterm";
 import type { FitAddon } from "@xterm/addon-fit";
 import type { SerializeAddon } from "@xterm/addon-serialize";
-import { getTheme, getFontValue, type TerminalTheme } from "../../themes";
+import { getTheme, getFontValue, withKoreanFallback, type TerminalTheme } from "../../themes";
 
 // ---------- Constants ----------
 export const MAX_PANES_PER_TAB = 3;
@@ -54,7 +54,9 @@ export const terminalStore = {
 let _currentTheme: TerminalTheme = getTheme(null);
 let _currentFontFamily: string = getFontValue(null);
 export function getCurrentTheme(): TerminalTheme { return _currentTheme; }
-export function getCurrentFontFamily(): string { return _currentFontFamily; }
+// 터미널에 먹일 최종 스택. 한글 폴백은 여기서 한 번만 붙인다 —
+// 이 값을 읽는 곳(Pane 생성, applyFontToAllPanes)이 곧 xterm에 넣는 곳이다.
+export function getCurrentFontFamily(): string { return withKoreanFallback(_currentFontFamily); }
 export function setCurrentTheme(t: TerminalTheme): void { _currentTheme = t; }
 export function setCurrentFontFamily(f: string): void { _currentFontFamily = f; }
 

@@ -10,7 +10,7 @@ import type { ContextMenuItem } from "../sidebar/types";
 import type { Lang } from "../../i18n";
 
 type SidebarPosition = "left" | "right";
-type SettingsSection = "font" | "theme" | "layout" | "log" | "data";
+type SettingsSection = "font" | "theme" | "terminal" | "layout" | "log" | "data";
 
 function attach<C extends Record<string, any>>(
   Component: any,

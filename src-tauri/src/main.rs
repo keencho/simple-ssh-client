@@ -1447,6 +1447,8 @@ struct AppConfig {
     ssh_verbose: Option<bool>,    // when true, adds -v to ssh args + tees PTY to log file
     #[serde(default)]
     data_path: Option<String>,    // custom sessions.json path; None = data_dir/sessions.json
+    #[serde(default)]
+    copy_on_select: Option<bool>, // when true, a terminal selection is copied to the clipboard immediately
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -1492,6 +1494,21 @@ fn set_terminal_font(name: String, app: AppHandle) -> Result<(), String> {
     cfg.terminal_font = Some(name.clone());
     save_config(&cfg)?;
     app.emit("terminal-font-changed", name).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_copy_on_select() -> bool {
+    load_config().copy_on_select.unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_copy_on_select(enabled: bool, app: AppHandle) -> Result<(), String> {
+    let mut cfg = load_config();
+    cfg.copy_on_select = Some(enabled);
+    save_config(&cfg)?;
+    // Detached terminal windows each hold their own copy of the flag.
+    app.emit("copy-on-select-changed", enabled).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2155,6 +2172,7 @@ fn main() {
             get_terminal_theme, set_terminal_theme,
             get_terminal_font, set_terminal_font,
             get_log_dir, set_log_dir, get_ssh_verbose, set_ssh_verbose,
+            get_copy_on_select, set_copy_on_select,
             clear_logs, open_path_in_os,
             get_data_file_path, set_data_file_path,
             export_sessions_to, import_sessions_from,

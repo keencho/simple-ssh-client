@@ -19,6 +19,7 @@
     isMainWindow,
     myWindowLabel,
     handleShortcut,
+    setCopyOnSelectFlag,
     adjustActiveFontSize,
     startDividerDrag,
     resetDividerToCenter,
@@ -30,6 +31,7 @@
   import { tabDnd, paneDnd, installGlobalDragCleanup } from "../../dnd/terminalDnd";
   import Tab from "./Tab.svelte";
   import Pane from "./Pane.svelte";
+  import Toast from "../ui/Toast.svelte";
 
   // Scope add-tab / merge-tab to this window's label
   const scoped = { target: { kind: "AnyLabel" as const, label: myWindowLabel } };
@@ -73,6 +75,11 @@
       applyFontName(event.payload);
     }).then((u) => unlisteners.push(u));
 
+    // 분리된 터미널 창은 자기 프로세스가 아니므로 설정 변경을 이벤트로 받는다.
+    void listen<boolean>("copy-on-select-changed", (event) => {
+      setCopyOnSelectFlag(event.payload);
+    }).then((u) => unlisteners.push(u));
+
     // ---------- Add / merge tab ----------
     void listen<AddTabPayload>("add-tab", (event) => {
       void addTab(event.payload);
@@ -107,7 +114,19 @@
     unlisteners.push(() => window.removeEventListener("resize", onResize));
 
     // ---------- Keyboard shortcuts (capture phase to beat xterm) ----------
-    const onKeydown = (e: KeyboardEvent) => { handleShortcut(e); };
+    const onKeydown = (e: KeyboardEvent) => {
+      // IME 조합 중에는 손대지 않는다: 조합 중에도 e.code는 물리 키 그대로라
+      // 단축키로 오인해 preventDefault()를 부르면 한글 조합이 깨진다.
+      if (e.isComposing || e.keyCode === 229) return;
+      // 진짜 입력 필드(세션 모달, 설정, 세션 피커 검색창 등)에 포커스가 있으면
+      // 손대지 않는다. 안 그러면 Ctrl+V가 입력창이 아니라 PTY로 가버린다.
+      // xterm의 숨은 textarea는 예외 — 그건 터미널 입력이다.
+      const target = e.target as HTMLElement | null;
+      if (target
+          && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+          && !target.classList.contains("xterm-helper-textarea")) return;
+      handleShortcut(e);
+    };
     document.addEventListener("keydown", onKeydown, { capture: true });
     unlisteners.push(() => document.removeEventListener("keydown", onKeydown, { capture: true }));
 
@@ -175,6 +194,7 @@
         if (savedTheme) applyThemeName(savedTheme);
         const savedFont = await Config.getTerminalFont();
         if (savedFont) applyFontName(savedFont);
+        setCopyOnSelectFlag(await Config.getCopyOnSelect());
         const initial = await Ssh.ptyTakePending(myWindowLabel);
         if (initial) await addTab(initial);
       } catch (e) {
@@ -220,3 +240,4 @@
     </div>
   {/if}
 </div>
+<Toast />
